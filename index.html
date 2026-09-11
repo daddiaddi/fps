@@ -245,21 +245,23 @@
     <div class="field-label">YOUR NAME</div>
     <input class="field-input" id="name-input" maxlength="12" placeholder="GHOST" spellcheck="false">
 
-    <div class="field-label">ROOM CODE  <span style="color:#2a2a2a">(leave blank to host)</span></div>
-    <input class="field-input" id="room-input" maxlength="3" placeholder="3-LETTER CODE" spellcheck="false" style="text-transform:uppercase">
+    <div class="field-label">CONNECTION</div>
+    <textarea class="field-input" id="signal-input" placeholder="Paste the connection text here" spellcheck="false" style="height:90px;resize:vertical;font-family:monospace;font-size:11px;text-transform:none"></textarea>
 
     <div class="btn-row">
       <button class="btn btn-host" onclick="hostGame()">HOST</button>
       <button class="btn btn-join" onclick="joinGame()">JOIN</button>
     </div>
+    <div class="btn-row" style="margin-top:8px">
+      <button class="btn" onclick="applySignal()">USE / SEND TEXT</button>
+      <button class="btn" onclick="copySignal()">COPY TEXT</button>
+    </div>
 
     <div id="status-bar">READY.</div>
-    <button class="btn" style="margin-top:10px" onclick="setFirebaseDatabaseUrlFromPrompt()">SET FIREBASE</button>
 
-    <div id="room-code-display">
-      <div id="room-code-label">SHARE THIS CODE</div>
-      <div id="room-code-val" onclick="copyCode()">———</div>
-      <div id="room-code-hint">click to copy · waiting for players...</div>
+    <div id="room-code-display" style="display:block">
+      <div id="room-code-label">HOW TO CONNECT</div>
+      <div id="room-code-hint" style="line-height:1.5">Host: click HOST, then copy the text and send it to the other player.<br>Joiner: paste it, click JOIN, then send your answer back to the host.<br>Host: paste the answer and click USE / SEND TEXT.</div>
     </div>
 
     <div id="controls-hint">
@@ -319,13 +321,7 @@
   <div id="conn-lost-btn" onclick="location.reload()">RETURN TO LOBBY</div>
 </div>
 
-<script type="module">
-  // Firebase signaling uses normal HTTPS-based Firebase Realtime Database
-  // instead of Trystero's default Nostr WebSocket relays.
-  window.VOID_TRYSTERO_READY = import('https://cdn.jsdelivr.net/npm/@trystero-p2p/firebase@0.25.4/+esm')
-    .then(mod => { console.log('[VOID.NET] Trystero Firebase loaded'); return mod; })
-    .catch(err => { console.error('[VOID.NET] Trystero Firebase failed to load:', err); throw err; });
-</script>
+
 <script>
 'use strict';
 
@@ -410,516 +406,227 @@ function randomSpawn(idx) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// NETWORKING (Trystero P2P)
+// NETWORKING (manual WebRTC signaling — no server / no API key)
 // ═══════════════════════════════════════════════════════════
-// PeerJS and Nostr have been removed completely.
-//
-// IMPORTANT: put your Firebase Realtime Database URL here. This is NOT a
-// password or API secret. Both players must use the same database URL.
-// Example: https://your-project-default-rtdb.firebaseio.com
-const FIREBASE_DATABASE_URL = '';
-
-//
-// Trystero uses WebRTC for game traffic and Firebase Realtime Database for
-// signaling. Firebase uses HTTPS-backed infrastructure rather than the public
-// Nostr WebSocket relays that were failing on your school network.
-
-let peer = null;              // Trystero room
-let hostConn = null;          // { peer: hostPeerId } on clients
-let clientConns = {};         // known peers on host
+let peer = null;
+let hostConn = null;
+let clientConns = {};
 let isHost = false;
 let myId = '';
-let hostPeerId = '';
 let localName = 'GHOST';
-let netAction = null;
-let trysteroMod = null;
-let joinRetryTimer = null;
-let connectTimeout = null;
+let manualRole = '';
+let manualPc = null;
+let manualChannel = null;
 
-const NET_MSG = {
-  JOIN:    'J',
-  WELCOME: 'W',
-  STATE:   'S',
-  SHOOT:   'F',
-  HIT:     'H',
-  DIE:     'D',
-  RESPAWN: 'R',
-  LEAVE:   'L',
-  PING:    'P',
-};
-
-const ICE_SERVERS = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:stun2.l.google.com:19302' },
-  { urls: 'stun:stun.cloudflare.com:3478' },
-  { urls: 'stun:global.stun.twilio.com:3478' },
-  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turns:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:staticauth.openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:relay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-  { urls: 'turn:relay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
-];
-
-const NET_CONNECT_TIMEOUT = 20000;
-
-const NET_DEBUG = true;
-function netLog(...args) {
-  if (NET_DEBUG) console.log('%c[VOID.NET]', 'color:#7ec8e3;font-weight:bold', ...args);
-}
-
-window.addEventListener('error', e =>
-  console.error('[VOID.ERROR]', e.message, e.filename + ':' + e.lineno)
-);
-
-const CODE_LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
-
-function makeRoomCode() {
-  let s = '';
-  for (let i = 0; i < 3; i++) {
-    s += CODE_LETTERS[Math.floor(Math.random() * CODE_LETTERS.length)];
-  }
-  return s;
-}
-
-function cleanupNetwork() {
-  if (connectTimeout) {
-    clearTimeout(connectTimeout);
-    connectTimeout = null;
-  }
-  if (joinRetryTimer) {
-    clearInterval(joinRetryTimer);
-    joinRetryTimer = null;
-  }
-
-  if (peer && typeof peer.leave === 'function') {
-    try { peer.leave(); } catch (_) {}
-  }
-
-  peer = null;
-  netAction = null;
-  hostConn = null;
-  hostPeerId = '';
-  clientConns = {};
-}
-
-async function createRoom(roomCode) {
-  try {
-    trysteroMod = await window.VOID_TRYSTERO_READY;
-    const { joinRoom, selfId } = trysteroMod;
-
-    const dbUrl = (FIREBASE_DATABASE_URL || localStorage.getItem('void.firebaseDbUrl') || '').trim().replace(/\/$/, '');
-    if (!dbUrl || !/^https:\/\//i.test(dbUrl)) {
-      setStatus('SET FIREBASE DATABASE URL IN THE FILE');
-      console.error('[VOID.NET] Firebase database URL is missing.');
-      return false;
-    }
-
-    const roomId = 'VOID-' + roomCode;
-
-    peer = joinRoom(
-      {
-        appId: dbUrl,
-        relayConfig: {
-          warnOnRelayFailure: false
-        },
-        rtcConfig: {
-          iceServers: ICE_SERVERS,
-          iceTransportPolicy: 'all',
-          bundlePolicy: 'max-bundle',
-          rtcpMuxPolicy: 'require'
-        },
-      },
-      roomId,
-      {
-        onJoinError: details => {
-          console.error('[VOID.NET] Trystero join error:', details);
-          if (!gameRunning) {
-            setStatus('P2P BLOCKED · TRY ANOTHER NETWORK');
-          }
-        }
-      }
-    );
-
-    myId = selfId;
-
-    netAction = peer.makeAction('void-game-v3');
-
-    // Log WebRTC transport state so a school firewall failure is visible.
-    netAction.onMessage = (msg, meta) => {
-      if (!msg || !msg.t) return;
-
-      const senderId = meta && meta.peerId;
-      netLog('recv ←', senderId || '?', msg);
-
-      if (isHost) {
-        // Host receives JOIN/HIT and also sees direct STATE/SHOOT packets.
-        onHostReceive(senderId, msg);
-      } else {
-        onClientReceive(msg);
-      }
-    };
-
-    peer.onPeerJoin = peerId => {
-      netLog('Peer discovered:', peerId);
-
-      if (isHost) {
-        clientConns[peerId] = { peer: peerId };
-        return;
-      }
-
-      // We do not know which discovered peer is the host yet.
-      // Send JOIN directly to every newly discovered peer. The real host
-      // answers with WELCOME; other clients simply ignore the message.
-      if (!hostPeerId) {
-        sendToPeer(peerId, NET_MSG.JOIN, {
-          name: localName,
-          id: myId
-        });
-      }
-    };
-
-    // Quick local ICE probe. This does not connect to the game; it only tells us
-    // whether the browser can obtain a TURN relay candidate on the current network.
-    try {
-      const probe = new RTCPeerConnection({ iceServers: ICE_SERVERS, iceTransportPolicy: 'all' });
-      probe.createDataChannel('probe');
-      probe.onicecandidate = ev => {
-        if (!ev.candidate) { probe.close(); return; }
-        const c = ev.candidate.candidate || '';
-        if (c.includes('typ relay')) netLog('TURN relay candidate available:', c);
-      };
-      probe.createOffer().then(o => probe.setLocalDescription(o)).catch(() => probe.close());
-      setTimeout(() => { try { probe.close(); } catch (_) {} }, 8000);
-    } catch (_) {}
-
-    peer.onPeerLeave = peerId => {
-      netLog('Peer left:', peerId);
-
-      if (isHost) {
-        onClientDisconnected(peerId);
-        return;
-      }
-
-      if (peerId === hostPeerId) {
-        onHostDisconnected();
-      }
-
-      delete players[peerId];
-      updateScoreboard();
-    };
-
-    return true;
-  } catch (err) {
-    console.error('[VOID.NET] Trystero setup failed:', err);
-    setStatus('NETWORK LIBRARY FAILED · REFRESH');
-    return false;
-  }
-}
-
-function sendToPeer(peerId, type, data) {
-  if (!netAction || !peerId) return;
-  try {
-    netAction.send({ t: type, d: data }, { target: peerId });
-  } catch (e) {
-    netLog('sendToPeer failed:', e);
-  }
-}
+const NET_MSG = { JOIN:'J', WELCOME:'W', STATE:'S', SHOOT:'F', HIT:'H', DIE:'D', RESPAWN:'R', LEAVE:'L', PING:'P' };
 
 function netSend(conn, type, data) {
-  const target = typeof conn === 'string' ? conn : conn && conn.peer;
-  if (target) sendToPeer(target, type, data);
+  try { if (conn && conn.readyState === 'open') conn.send(JSON.stringify({t:type,d:data})); } catch(e) { netLog('send() failed:', e); }
 }
-
 function netBroadcast(type, data, exceptId) {
-  if (!netAction) return;
+  for (const [id,c] of Object.entries(clientConns)) if (id !== exceptId) netSend(c,type,data);
+}
+const NET_DEBUG = true;
+function netLog(...args) { if (NET_DEBUG) console.log('%c[VOID.NET]','color:#7ec8e3;font-weight:bold',...args); }
+window.addEventListener('error', e => console.error('[VOID.ERROR]', e.message, e.filename+':'+e.lineno));
 
-  try {
-    // For the host we know the connected client IDs, so we can target them.
-    // For a client, a normal broadcast reaches the other peers in the room.
-    if (isHost) {
-      const targets = Object.keys(clientConns).filter(id => id !== exceptId);
-      if (targets.length) {
-        netAction.send({ t: type, d: data }, { target: targets });
-      }
+// STUN is optional. It needs no account or API key. If the school blocks WebRTC
+// entirely, a one-file GitHub Pages game cannot bypass that restriction.
+const ICE_SERVERS = [
+  {urls:'stun:stun.l.google.com:19302'},
+  {urls:'stun:stun.cloudflare.com:3478'},
+  {urls:'stun:global.stun.twilio.com:3478'}
+];
+
+function makeId() { return 'p-' + Math.random().toString(36).slice(2,10); }
+function encodeSignal(obj) {
+  const text = JSON.stringify(obj);
+  const bytes = new TextEncoder().encode(text);
+  let bin=''; for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+function decodeSignal(str) {
+  const bin = atob(str.trim()); const bytes = Uint8Array.from(bin,c=>c.charCodeAt(0));
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+function setSignal(text) {
+  const el=document.getElementById('signal-input'); el.value=text;
+  el.focus(); el.select();
+}
+async function copySignal() {
+  const v=document.getElementById('signal-input').value.trim();
+  if(!v) { setStatus('NO CONNECTION TEXT'); return; }
+  try { await navigator.clipboard.writeText(v); setStatus('COPIED'); }
+  catch(_) { document.getElementById('signal-input').select(); setStatus('PRESS CTRL+C'); }
+}
+function waitIce(pc) {
+  if (pc.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise(resolve => {
+    const done=()=>{ if(pc.iceGatheringState==='complete'){pc.removeEventListener('icegatheringstatechange',done);resolve();} };
+    pc.addEventListener('icegatheringstatechange',done);
+    setTimeout(()=>{pc.removeEventListener('icegatheringstatechange',done);resolve();},8000);
+  });
+}
+function closeManual() {
+  try { if(manualPc) manualPc.close(); } catch(_) {}
+  manualPc=null; manualChannel=null; hostConn=null; clientConns={};
+}
+function wireChannel(ch, side) {
+  manualChannel=ch;
+  ch.onopen=()=>{
+    netLog('Data channel OPEN');
+    if(side==='host') {
+      const id='client-'+makeId(); clientConns[id]=ch; ch._voidId=id;
+      setStatus('PLAYER CONNECTED');
+      initMyPlayer(); startGame();
     } else {
-      netAction.send({ t: type, d: data });
+      hostConn=ch; setStatus('CONNECTED · WAITING…');
+      netSend(ch,NET_MSG.JOIN,{name:localName,id:myId});
     }
-  } catch (e) {
-    netLog('broadcast failed:', e);
-  }
-}
-
-function hostSnapshot() {
-  const snapshot = [];
-
-  // Include the host itself.
-  if (me && myId) {
-    snapshot.push({
-      id: myId,
-      name: localName,
-      x: me.x,
-      y: me.y,
-      z: me.z,
-      yaw: me.yaw,
-      hp: me.hp,
-      kills: me.kills,
-      deaths: me.deaths
-    });
-  }
-
-  for (const [pid, p] of Object.entries(players)) {
-    if (pid === myId) continue;
-    snapshot.push({
-      id: pid,
-      name: p.name,
-      x: p.x,
-      y: p.y,
-      z: p.z,
-      yaw: p.yaw,
-      hp: p.hp,
-      kills: p.kills,
-      deaths: p.deaths
-    });
-  }
-
-  return snapshot;
-}
-
-function setFirebaseDatabaseUrlFromPrompt() {
-  const current = FIREBASE_DATABASE_URL || localStorage.getItem('void.firebaseDbUrl') || '';
-  const url = prompt('Paste your Firebase Realtime Database URL:', current);
-  if (url && /^https:\/\//i.test(url.trim())) {
-    localStorage.setItem('void.firebaseDbUrl', url.trim().replace(/\/$/, ''));
-    setStatus('FIREBASE URL SAVED · HOST OR JOIN');
-  } else if (url !== null) {
-    setStatus('INVALID FIREBASE URL');
-  }
+  };
+  ch.onmessage=e=>{
+    try { const d=JSON.parse(e.data); if(side==='host') onHostReceive(ch._voidId,d); else onClientReceive(d); }
+    catch(err){netLog('Bad network packet',err);} 
+  };
+  ch.onclose=()=>{
+    netLog('Data channel CLOSED');
+    if(side==='host') { const id=ch._voidId; if(id) onClientDisconnected(id); }
+    else onHostDisconnected();
+  };
+  ch.onerror=e=>netLog('Data channel error',e);
 }
 
 async function hostGame() {
-  localName = (document.getElementById('name-input').value.trim().toUpperCase() || 'GHOST').slice(0,12);
-  setStatus('CONNECTING…');
+  localName=(document.getElementById('name-input').value.trim().toUpperCase()||'GHOST').slice(0,12);
+  closeManual(); manualRole='host'; isHost=true; myId='host-'+makeId();
+  setStatus('CREATING OFFER…');
+  manualPc=new RTCPeerConnection({iceServers:ICE_SERVERS});
+  manualChannel=manualPc.createDataChannel('void-fps',{ordered:true});
+  wireChannel(manualChannel,'host');
+  manualPc.oniceconnectionstatechange=()=>netLog('ICE:',manualPc.iceConnectionState);
+  const offer=await manualPc.createOffer();
+  await manualPc.setLocalDescription(offer);
+  await waitIce(manualPc);
+  setSignal(encodeSignal({v:1,type:'offer',sdp:manualPc.localDescription.sdp}));
+  setStatus('OFFER READY · SEND TEXT TO PLAYER');
+}
 
-  cleanupNetwork();
-  isHost = true;
-  clientConns = {};
+async function joinGame() {
+  localName=(document.getElementById('name-input').value.trim().toUpperCase()||'GHOST').slice(0,12);
+  const raw=document.getElementById('signal-input').value.trim();
+  if(!raw){setStatus('PASTE HOST TEXT FIRST');return;}
+  let sig; try{sig=decodeSignal(raw);}catch(e){setStatus('INVALID CONNECTION TEXT');return;}
+  if(sig.type!=='offer'){setStatus('NEED A HOST OFFER');return;}
+  closeManual(); manualRole='client'; isHost=false; myId='client-'+makeId();
+  setStatus('CREATING ANSWER…');
+  manualPc=new RTCPeerConnection({iceServers:ICE_SERVERS});
+  manualPc.ondatachannel=e=>wireChannel(e.channel,'client');
+  manualPc.oniceconnectionstatechange=()=>netLog('ICE:',manualPc.iceConnectionState);
+  await manualPc.setRemoteDescription({type:'offer',sdp:sig.sdp});
+  const answer=await manualPc.createAnswer();
+  await manualPc.setLocalDescription(answer);
+  await waitIce(manualPc);
+  setSignal(encodeSignal({v:1,type:'answer',sdp:manualPc.localDescription.sdp}));
+  setStatus('ANSWER READY · SEND TEXT TO HOST');
+}
 
-  const code = makeRoomCode();
-  netLog('Hosting with Trystero/Firebase — room:', code);
-
-  const ok = await createRoom(code);
-  if (!ok) {
-    isHost = false;
-    return;
-  }
-
-  document.getElementById('room-code-val').textContent = code;
-  document.getElementById('room-code-display').style.display = 'block';
-  setStatus('HOSTING · ' + code);
-
-  initMyPlayer();
-  players[myId] = createNetPlayer(myId, localName, { x: me.x, z: me.z });
-  startGame();
-
-  netLog('Room ready. My peer ID:', myId);
+async function applySignal() {
+  const raw=document.getElementById('signal-input').value.trim();
+  if(!raw){setStatus('NO CONNECTION TEXT');return;}
+  let sig;try{sig=decodeSignal(raw);}catch(e){setStatus('INVALID CONNECTION TEXT');return;}
+  if(sig.type!=='answer'){setStatus('HOST NEEDS A PLAYER ANSWER');return;}
+  if(!manualPc || manualRole!=='host'){setStatus('HOST FIRST');return;}
+  try {
+    await manualPc.setRemoteDescription({type:'answer',sdp:sig.sdp});
+    setStatus('CONNECTING TO PLAYER…');
+  } catch(e) { console.error(e); setStatus('ANSWER FAILED'); }
 }
 
 function onClientDisconnected(peerId) {
-  if (!clientConns[peerId] && !players[peerId]) return;
-
+  if (!clientConns[peerId] && !players[peerId]) return; // already handled
   const name = players[peerId] ? players[peerId].name : 'PLAYER';
-
   netBroadcast(NET_MSG.LEAVE, { id: peerId });
   delete clientConns[peerId];
   delete players[peerId];
-
   updateScoreboard();
   if (gameRunning) showFeedMessage(name + ' DISCONNECTED');
 }
 
-async function joinGame() {
-  localName = (document.getElementById('name-input').value.trim().toUpperCase() || 'GHOST').slice(0,12);
-
-  const raw = document.getElementById('room-input').value.trim().toUpperCase();
-  if (!/^[A-Z]{3}$/.test(raw)) {
-    setStatus('ENTER THE 3-LETTER ROOM CODE');
-    return;
-  }
-
-  setStatus('CONNECTING…');
-
-  cleanupNetwork();
-  isHost = false;
-  hostPeerId = '';
-
-  const ok = await createRoom(raw);
-  if (!ok) return;
-
-  setStatus('FINDING ROOM…');
-  netLog('Joined Trystero room:', 'VOID-' + raw, 'my peer:', myId);
-
-  // If the host is already visible, send immediately. Otherwise onPeerJoin
-  // will do it when discovery finds the host.
-  const sendJoin = () => {
-    if (hostPeerId) return;
-
-    try {
-      // Trystero's internal peer list is not part of the public API, so the
-      // reliable method is to broadcast JOIN. The host will receive it.
-      netAction.send({
-        t: NET_MSG.JOIN,
-        d: { name: localName, id: myId }
-      });
-    } catch (e) {
-      netLog('JOIN broadcast failed:', e);
-    }
-  };
-
-  sendJoin();
-
-  // Retry JOIN while discovery is happening. This handles a room where the
-  // host was already present before this browser finished connecting.
-  joinRetryTimer = setInterval(() => {
-    if (gameRunning || hostPeerId) {
-      clearInterval(joinRetryTimer);
-      joinRetryTimer = null;
-      return;
-    }
-    sendJoin();
-  }, 1200);
-
-  connectTimeout = setTimeout(() => {
-    if (!gameRunning) {
-      setStatus('NO CONNECTION · FIREWALL MAY BLOCK WEBRTC');
-      netLog('Timed out waiting for a host/WELCOME');
-    }
-  }, NET_CONNECT_TIMEOUT);
-}
-
 function onHostDisconnected() {
-  if (!gameRunning) {
-    setStatus('DISCONNECTED');
-    return;
-  }
+  if (!gameRunning) { setStatus('DISCONNECTED'); return; }
   showConnLostOverlay('HOST LEFT OR CONNECTION DROPPED');
 }
 
 function onHostReceive(senderId, msg) {
-  if (!senderId || !msg) return;
-
   switch(msg.t) {
     case NET_MSG.JOIN: {
-      if (senderId === myId) return;
-
-      clientConns[senderId] = { peer: senderId };
-
-      const name = String(msg.d?.name || 'GHOST').slice(0, 12);
-      netLog('Player joined:', name, '(' + senderId + ')');
-
+      netLog('Player joined:', msg.d.name, '(' + senderId + ')');
+      // Send welcome with full game state
       const sp = randomSpawn(Object.keys(players).length);
-      players[senderId] = createNetPlayer(senderId, name, sp);
-
+      players[senderId] = createNetPlayer(senderId, msg.d.name, sp);
       const welcome = {
         yourId: senderId,
-        hostId: myId,
-        players: hostSnapshot(),
-        spawnX: sp.x,
-        spawnZ: sp.z
+        players: Object.entries(players).map(([pid,p]) => ({
+          id: pid, name: p.name, x: p.x, y: p.y, z: p.z,
+          yaw: p.yaw, hp: p.hp, kills: p.kills, deaths: p.deaths
+        })),
+        spawnX: sp.x, spawnZ: sp.z
       };
-
-      sendToPeer(senderId, NET_MSG.WELCOME, welcome);
-
+      netSend(clientConns[senderId], NET_MSG.WELCOME, welcome);
       netBroadcast(NET_MSG.STATE, {
-        id: senderId,
-        name,
-        x: sp.x,
-        y: EYE_H,
-        z: sp.z,
-        yaw: 0,
-        pitch: 0,
-        hp: MAX_HP,
-        kills: 0,
-        deaths: 0,
-        cr: false
+        id: senderId, name: msg.d.name, x: sp.x, z: sp.z, hp: MAX_HP, kills:0, deaths:0
       }, senderId);
-
-      showFeedMessage(name + ' JOINED');
+      showFeedMessage(msg.d.name + ' JOINED');
       updateScoreboard();
       break;
     }
-
     case NET_MSG.STATE: {
-      if (senderId === myId || !players[senderId]) return;
-
-      players[senderId].netX = msg.d.x;
-      players[senderId].netZ = msg.d.z;
-      players[senderId].netY = msg.d.y;
-      players[senderId].yaw  = msg.d.yaw;
-      players[senderId].pitch = msg.d.pitch;
-      players[senderId].crouching = msg.d.cr;
-
-      // Trystero already delivers this packet directly to every client.
-      // Do not relay it through the host or clients would see duplicates.
+      if (players[senderId]) {
+        players[senderId].netX = msg.d.x;
+        players[senderId].netZ = msg.d.z;
+        players[senderId].netY = msg.d.y;
+        players[senderId].yaw  = msg.d.yaw;
+        players[senderId].pitch = msg.d.pitch;
+        players[senderId].crouching = msg.d.cr;
+      }
+      netBroadcast(NET_MSG.STATE, { ...msg.d, id: senderId }, senderId);
       break;
     }
-
     case NET_MSG.SHOOT: {
-      // The shooter packet is already direct P2P. The host only needs the
-      // visual effect for itself.
-      if (senderId !== myId) spawnBulletEffect(msg.d);
+      netBroadcast(NET_MSG.SHOOT, { ...msg.d, id: senderId }, senderId);
       break;
     }
-
     case NET_MSG.HIT: {
-      // Only the host receives damage requests. This prevents clients from
-      // applying their own local damage and keeps the host authoritative.
       const target = msg.d.targetId;
-
       if (players[target]) {
         players[target].hp -= msg.d.dmg;
-
         if (players[target].hp <= 0) {
           players[target].hp = 0;
           players[target].deaths++;
-          if (players[senderId]) players[senderId].kills++;
-
-          const dieMsg = {
-            victimId: target,
-            killerId: senderId,
+          players[senderId] && players[senderId].kills++;
+          // broadcast die
+          const dieMsg = { victimId: target, killerId: senderId,
             victimName: players[target].name,
-            killerName: players[senderId]?.name || '?'
-          };
-
+            killerName: players[senderId]?.name || '?' };
           netBroadcast(NET_MSG.DIE, dieMsg);
-
+          netSend(clientConns[senderId], NET_MSG.DIE, dieMsg);
+          if (clientConns[target]) netSend(clientConns[target], NET_MSG.DIE, dieMsg);
+          // respawn after delay
           setTimeout(() => {
-            if (!players[target]) return;
-
             const sp2 = randomSpawn(Math.floor(Math.random()*7));
             players[target].hp = MAX_HP;
             players[target].x = sp2.x;
             players[target].z = sp2.z;
-            players[target].netX = sp2.x;
-            players[target].netZ = sp2.z;
-
-            netBroadcast(NET_MSG.RESPAWN, {
-              id: target,
-              x: sp2.x,
-              z: sp2.z
-            });
+            const rMsg = { id: target, x: sp2.x, z: sp2.z };
+            netBroadcast(NET_MSG.RESPAWN, rMsg);
+            if (clientConns[target]) netSend(clientConns[target], NET_MSG.RESPAWN, rMsg);
           }, RESPAWN_SEC * 1000);
         } else {
-          netBroadcast(NET_MSG.HIT, {
-            dmg: msg.d.dmg,
-            fromId: senderId,
-            targetId: target
-          });
+          // relay damage to target
+          if (clientConns[target]) netSend(clientConns[target], NET_MSG.HIT, { dmg: msg.d.dmg, fromId: senderId });
+          netBroadcast(NET_MSG.HIT, { targetId: target, dmg: msg.d.dmg }, senderId);
         }
       }
-
       updateScoreboard();
       break;
     }
@@ -930,54 +637,25 @@ function onClientReceive(msg) {
   switch(msg.t) {
     case NET_MSG.WELCOME: {
       const d = msg.d;
-
-      clearTimeout(connectTimeout);
-      connectTimeout = null;
-
-      if (joinRetryTimer) {
-        clearInterval(joinRetryTimer);
-        joinRetryTimer = null;
-      }
-
-      hostPeerId = d.hostId;
-      hostConn = { peer: hostPeerId };
-
+      // The host assigns the same id that the client sent in its JOIN packet.
+      // Keeping this id consistent is important for state/hit messages.
+      myId = d.yourId;
       d.players.forEach(p => {
-        if (p.id !== myId) {
-          players[p.id] = createNetPlayer(
-            p.id,
-            p.name || '?',
-            { x: p.x, z: p.z }
-          );
-          players[p.id].kills = p.kills || 0;
-          players[p.id].deaths = p.deaths || 0;
-          players[p.id].hp = p.hp ?? MAX_HP;
-          players[p.id].yaw = p.yaw || 0;
+        if (p.id !== d.yourId) {
+          players[p.id] = createNetPlayer(p.id, p.name, { x: p.x, z: p.z });
+          players[p.id].kills  = p.kills;
+          players[p.id].deaths = p.deaths;
         }
       });
-
       initMyPlayer(d.spawnX, d.spawnZ);
-      setStatus('CONNECTED · STARTING…');
       startGame();
       updateScoreboard();
-
-      netLog('WELCOME received. Host:', hostPeerId);
       break;
     }
-
     case NET_MSG.STATE: {
       const d = msg.d;
       if (d.id === myId) return;
-
-      if (!players[d.id]) {
-        players[d.id] = createNetPlayer(
-          d.id,
-          d.name || '?',
-          { x: d.x, z: d.z }
-        );
-      }
-
-      if (d.name) players[d.id].name = d.name;
+      if (!players[d.id]) players[d.id] = createNetPlayer(d.id, d.name || '?', { x: d.x, z: d.z });
       players[d.id].netX = d.x;
       players[d.id].netZ = d.z;
       players[d.id].netY = d.y;
@@ -986,44 +664,32 @@ function onClientReceive(msg) {
       players[d.id].crouching = d.cr;
       break;
     }
-
     case NET_MSG.SHOOT: {
       if (msg.d.id !== myId) spawnBulletEffect(msg.d);
       break;
     }
-
     case NET_MSG.HIT: {
-      // Only authoritative host damage packets contain fromId + targetId.
-      // Ignore our own outbound hit request if it ever reaches us.
-      if (msg.d.targetId && msg.d.targetId !== myId) return;
-      if (msg.d.targetId === myId || msg.d.fromId) {
-        takeDamage(msg.d.dmg);
-      }
+      // We were hit
+      takeDamage(msg.d.dmg);
       break;
     }
-
     case NET_MSG.DIE: {
       const d = msg.d;
-
       if (d.victimId === myId) {
         onLocalDeath(d.killerName);
       }
-
       if (d.killerId === myId) {
         me.kills++;
         showKillFeed(d.killerName, d.victimName, true);
       } else {
         showKillFeed(d.killerName, d.victimName, false);
       }
-
       if (players[d.victimId]) players[d.victimId].hp = 0;
       updateScoreboard();
       break;
     }
-
     case NET_MSG.RESPAWN: {
       const d = msg.d;
-
       if (d.id === myId) {
         onLocalRespawn(d.x, d.z);
       } else if (players[d.id]) {
@@ -1033,7 +699,6 @@ function onClientReceive(msg) {
       }
       break;
     }
-
     case NET_MSG.LEAVE: {
       delete players[msg.d.id];
       updateScoreboard();
@@ -1120,7 +785,7 @@ document.addEventListener('mousedown', e => {
   if (!gameRunning) return;
   if (e.button === 0) shooting = true;
   if (e.button === 2) aiming = true;
-  if (!mouseLocked && document.pointerLockElement !== canvas) { try { canvas.requestPointerLock(); } catch (_) {} }
+  if (!mouseLocked) canvas.requestPointerLock();
 });
 document.addEventListener('mouseup', e => {
   if (e.button === 0) shooting = false;
@@ -1474,9 +1139,13 @@ function tryShoot() {
   // Raycast to find hit
   const hit = raycastShoot(me.x, me.y, me.z, shootYaw, shootPitch);
 
-  // Trystero sends the visual shot directly to every peer.
-  const shootData = { x: me.x, y: me.y, z: me.z, yaw: shootYaw, pitch: shootPitch, id: myId };
-  netBroadcast(NET_MSG.SHOOT, shootData);
+  // Broadcast shoot
+  const shootData = { x: me.x, y: me.y, z: me.z, yaw: shootYaw, pitch: shootPitch };
+  if (isHost) {
+    netBroadcast(NET_MSG.SHOOT, { ...shootData, id: myId });
+  } else if (hostConn) {
+    netSend(hostConn, NET_MSG.SHOOT, shootData);
+  }
 
   if (hit) {
     showHitMarker();
@@ -1508,8 +1177,6 @@ function tryShoot() {
         updateScoreboard();
       }
     } else if (hostConn) {
-      // Damage requests go only to the host. The host sends the authoritative
-      // HIT/DIE result back to everyone.
       netSend(hostConn, NET_MSG.HIT, { targetId: hit.id, dmg: RIFLE_DMG });
     }
   }
@@ -1701,7 +1368,7 @@ function toggleKeys() {
   const el = document.getElementById('keys-overlay');
   el.classList.toggle('show');
   if (el.classList.contains('show')) document.exitPointerLock && document.exitPointerLock();
-  else if (document.pointerLockElement !== canvas) { try { canvas.requestPointerLock(); } catch (_) {} }
+  else canvas.requestPointerLock();
 }
 document.getElementById('keys-overlay').addEventListener('keydown', e => {
   if (e.code === 'F1' || e.code === 'Escape') toggleKeys();
@@ -1721,18 +1388,14 @@ function syncState(now) {
     id: myId, x: me.x, z: me.z, y: me.y,
     yaw: me.yaw, pitch: me.pitch, cr: me.crouching,
   };
-  // Movement is safe to send directly in the mesh; the host no longer needs
-  // to relay every position packet.
   if (isHost) {
-    netBroadcast(NET_MSG.STATE, { ...stateData, name: localName });
-    players[myId] = players[myId] || createNetPlayer(myId, localName, {x: me.x, z: me.z});
-    players[myId].x = me.x;
-    players[myId].z = me.z;
+    netBroadcast(NET_MSG.STATE, stateData);
+    // update host self in players for scoring display
+    players[myId] = players[myId] || {};
     players[myId].kills  = me.kills;
     players[myId].deaths = me.deaths;
-    players[myId].hp = me.hp;
-  } else if (netAction) {
-    netBroadcast(NET_MSG.STATE, { ...stateData, name: localName });
+  } else if (hostConn) {
+    netSend(hostConn, NET_MSG.STATE, stateData);
   }
 }
 
@@ -1763,8 +1426,13 @@ function startGame() {
   updateScoreboard();
   lastTime = performance.now();
   requestAnimationFrame(loop);
-  // Pointer lock is requested from the next user click, not here.
+  // Pointer lock is requested only from the user's mouse click handler.
+  // Browsers reject programmatic pointer-lock requests after async networking.
 }
+
+document.addEventListener('mousedown', () => {
+  if (gameRunning && document.pointerLockElement !== canvas) { try { canvas.requestPointerLock(); } catch(_) {} }
+});
 
 // Solo / offline test mode
 document.addEventListener('keydown', e => {
