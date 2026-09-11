@@ -254,6 +254,7 @@
     </div>
 
     <div id="status-bar">READY.</div>
+    <button class="btn" style="margin-top:10px" onclick="setFirebaseDatabaseUrlFromPrompt()">SET FIREBASE</button>
 
     <div id="room-code-display">
       <div id="room-code-label">SHARE THIS CODE</div>
@@ -319,27 +320,11 @@
 </div>
 
 <script type="module">
-  // Trystero replaces PeerJS. It uses decentralized Nostr discovery by default,
-  // so there is no single PeerJS server for a school network to block.
-  // Try two CDNs so a single blocked CDN does not kill multiplayer.
-  window.VOID_TRYSTERO_READY = (async () => {
-    const sources = [
-      'https://esm.run/trystero@0.25.4',
-      'https://cdn.jsdelivr.net/npm/trystero@0.25.4/+esm'
-    ];
-    let lastError = null;
-    for (const src of sources) {
-      try {
-        const mod = await import(src);
-        console.log('[VOID.NET] Trystero loaded from', src);
-        return mod;
-      } catch (err) {
-        lastError = err;
-        console.warn('[VOID.NET] Trystero CDN failed:', src, err);
-      }
-    }
-    throw lastError || new Error('Trystero failed to load');
-  })();
+  // Firebase signaling uses normal HTTPS-based Firebase Realtime Database
+  // instead of Trystero's default Nostr WebSocket relays.
+  window.VOID_TRYSTERO_READY = import('https://cdn.jsdelivr.net/npm/@trystero-p2p/firebase@0.25.4/+esm')
+    .then(mod => { console.log('[VOID.NET] Trystero Firebase loaded'); return mod; })
+    .catch(err => { console.error('[VOID.NET] Trystero Firebase failed to load:', err); throw err; });
 </script>
 <script>
 'use strict';
@@ -427,16 +412,17 @@ function randomSpawn(idx) {
 // ═══════════════════════════════════════════════════════════
 // NETWORKING (Trystero P2P)
 // ═══════════════════════════════════════════════════════════
-// PeerJS has been removed completely.
+// PeerJS and Nostr have been removed completely.
 //
-// Trystero uses WebRTC for the actual game traffic, but uses decentralized
-// Nostr relays for discovery/signalling instead of wss://0.peerjs.com.
-// That makes this much less dependent on one PeerJS endpoint.
+// IMPORTANT: put your Firebase Realtime Database URL here. This is NOT a
+// password or API secret. Both players must use the same database URL.
+// Example: https://your-project-default-rtdb.firebaseio.com
+const FIREBASE_DATABASE_URL = '';
+
 //
-// Important: if a school blocks ALL WebSockets, WebRTC, or public relay
-// traffic, no browser-only P2P library can guarantee a connection. In that
-// case a normal HTTPS game server is required. This version specifically
-// removes the PeerJS Cloud dependency that is failing in your logs.
+// Trystero uses WebRTC for game traffic and Firebase Realtime Database for
+// signaling. Firebase uses HTTPS-backed infrastructure rather than the public
+// Nostr WebSocket relays that were failing on your school network.
 
 let peer = null;              // Trystero room
 let hostConn = null;          // { peer: hostPeerId } on clients
@@ -524,13 +510,21 @@ async function createRoom(roomCode) {
     trysteroMod = await window.VOID_TRYSTERO_READY;
     const { joinRoom, selfId } = trysteroMod;
 
-    // The app ID is intentionally fixed so everyone uses the same discovery
-    // namespace. The room code keeps individual games separate.
+    const dbUrl = (FIREBASE_DATABASE_URL || localStorage.getItem('void.firebaseDbUrl') || '').trim().replace(/\/$/, '');
+    if (!dbUrl || !/^https:\/\//i.test(dbUrl)) {
+      setStatus('SET FIREBASE DATABASE URL IN THE FILE');
+      console.error('[VOID.NET] Firebase database URL is missing.');
+      return false;
+    }
+
     const roomId = 'VOID-' + roomCode;
 
     peer = joinRoom(
       {
-        appId: 'com.void.fps.multiplayer.v3',
+        appId: dbUrl,
+        relayConfig: {
+          warnOnRelayFailure: false
+        },
         rtcConfig: {
           iceServers: ICE_SERVERS,
           iceTransportPolicy: 'all',
@@ -694,6 +688,17 @@ function hostSnapshot() {
   return snapshot;
 }
 
+function setFirebaseDatabaseUrlFromPrompt() {
+  const current = FIREBASE_DATABASE_URL || localStorage.getItem('void.firebaseDbUrl') || '';
+  const url = prompt('Paste your Firebase Realtime Database URL:', current);
+  if (url && /^https:\/\//i.test(url.trim())) {
+    localStorage.setItem('void.firebaseDbUrl', url.trim().replace(/\/$/, ''));
+    setStatus('FIREBASE URL SAVED · HOST OR JOIN');
+  } else if (url !== null) {
+    setStatus('INVALID FIREBASE URL');
+  }
+}
+
 async function hostGame() {
   localName = (document.getElementById('name-input').value.trim().toUpperCase() || 'GHOST').slice(0,12);
   setStatus('CONNECTING…');
@@ -703,7 +708,7 @@ async function hostGame() {
   clientConns = {};
 
   const code = makeRoomCode();
-  netLog('Hosting with Trystero/Nostr — room:', code);
+  netLog('Hosting with Trystero/Firebase — room:', code);
 
   const ok = await createRoom(code);
   if (!ok) {
@@ -1115,7 +1120,7 @@ document.addEventListener('mousedown', e => {
   if (!gameRunning) return;
   if (e.button === 0) shooting = true;
   if (e.button === 2) aiming = true;
-  if (!mouseLocked) canvas.requestPointerLock();
+  if (!mouseLocked && document.pointerLockElement !== canvas) { try { canvas.requestPointerLock(); } catch (_) {} }
 });
 document.addEventListener('mouseup', e => {
   if (e.button === 0) shooting = false;
@@ -1696,7 +1701,7 @@ function toggleKeys() {
   const el = document.getElementById('keys-overlay');
   el.classList.toggle('show');
   if (el.classList.contains('show')) document.exitPointerLock && document.exitPointerLock();
-  else canvas.requestPointerLock();
+  else if (document.pointerLockElement !== canvas) { try { canvas.requestPointerLock(); } catch (_) {} }
 }
 document.getElementById('keys-overlay').addEventListener('keydown', e => {
   if (e.code === 'F1' || e.code === 'Escape') toggleKeys();
@@ -1758,7 +1763,7 @@ function startGame() {
   updateScoreboard();
   lastTime = performance.now();
   requestAnimationFrame(loop);
-  canvas.requestPointerLock();
+  // Pointer lock is requested from the next user click, not here.
 }
 
 // Solo / offline test mode
