@@ -318,7 +318,29 @@
   <div id="conn-lost-btn" onclick="location.reload()">RETURN TO LOBBY</div>
 </div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.5/peerjs.min.js"></script>
+<script type="module">
+  // Trystero replaces PeerJS. It uses decentralized Nostr discovery by default,
+  // so there is no single PeerJS server for a school network to block.
+  // Try two CDNs so a single blocked CDN does not kill multiplayer.
+  window.VOID_TRYSTERO_READY = (async () => {
+    const sources = [
+      'https://esm.run/trystero@0.25.4',
+      'https://cdn.jsdelivr.net/npm/trystero@0.25.4/+esm'
+    ];
+    let lastError = null;
+    for (const src of sources) {
+      try {
+        const mod = await import(src);
+        console.log('[VOID.NET] Trystero loaded from', src);
+        return mod;
+      } catch (err) {
+        lastError = err;
+        console.warn('[VOID.NET] Trystero CDN failed:', src, err);
+      }
+    }
+    throw lastError || new Error('Trystero failed to load');
+  })();
+</script>
 <script>
 'use strict';
 
@@ -403,14 +425,30 @@ function randomSpawn(idx) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// NETWORKING (PeerJS P2P)
+// NETWORKING (Trystero P2P)
 // ═══════════════════════════════════════════════════════════
-let peer = null;
-let hostConn = null;          // client → host
-let clientConns = {};         // host → clients
+// PeerJS has been removed completely.
+//
+// Trystero uses WebRTC for the actual game traffic, but uses decentralized
+// Nostr relays for discovery/signalling instead of wss://0.peerjs.com.
+// That makes this much less dependent on one PeerJS endpoint.
+//
+// Important: if a school blocks ALL WebSockets, WebRTC, or public relay
+// traffic, no browser-only P2P library can guarantee a connection. In that
+// case a normal HTTPS game server is required. This version specifically
+// removes the PeerJS Cloud dependency that is failing in your logs.
+
+let peer = null;              // Trystero room
+let hostConn = null;          // { peer: hostPeerId } on clients
+let clientConns = {};         // known peers on host
 let isHost = false;
 let myId = '';
+let hostPeerId = '';
 let localName = 'GHOST';
+let netAction = null;
+let trysteroMod = null;
+let joinRetryTimer = null;
+let connectTimeout = null;
 
 const NET_MSG = {
   JOIN:    'J',
@@ -424,33 +462,6 @@ const NET_MSG = {
   PING:    'P',
 };
 
-function netSend(conn, type, data) {
-  try { conn.send({ t: type, d: data }); } catch(e) { netLog('send() failed:', e); }
-}
-
-function netBroadcast(type, data, exceptId) {
-  for (const [id, c] of Object.entries(clientConns)) {
-    if (id !== exceptId) netSend(c, type, data);
-  }
-}
-
-// ─── Debug logging ───────────────────────────────────────────
-// Everything network-related logs to the console under [VOID.NET] so
-// connection problems (blocked CDN, NAT/firewall issues, dropped peers,
-// bad room codes) are visible instead of failing silently.
-const NET_DEBUG = true;
-function netLog(...args) {
-  if (NET_DEBUG) console.log('%c[VOID.NET]', 'color:#7ec8e3;font-weight:bold', ...args);
-}
-window.addEventListener('error', e => console.error('[VOID.ERROR]', e.message, e.filename + ':' + e.lineno));
-
-// PeerJS's built-in default ICE config relies on its own TURN relay as a
-// NAT-traversal fallback. That's the most likely source of a
-// "failed to load resource ... certificate invalid" error in the console —
-// either that relay is having cert problems, or something on the local
-// network (antivirus TLS inspection, a school/corporate proxy) is
-// intercepting the connection. Supplying our own well-known STUN servers
-// plus a public TURN relay avoids PeerJS's default entirely.
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
@@ -463,317 +474,425 @@ const ICE_SERVERS = [
   { urls: 'turn:relay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
   { urls: 'turn:relay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
 ];
-// Use PeerJS Cloud explicitly over HTTPS/WSS on port 443. This removes any
-// ambiguity about which signalling server the browser is trying to reach.
-// PeerJS Cloud is only the signalling service; TURN below handles difficult
-// NAT cases once signalling succeeds.
-const PEER_OPTS = {
-  host: '0.peerjs.com',
-  port: 443,
-  path: '/',
-  secure: true,
-  debug: 1,
-  config: {
-    iceServers: ICE_SERVERS,
-    sdpSemantics: 'unified-plan'
-  }
-};
 
-const NET_CONNECT_TIMEOUT = 15000;
-const NET_RETRY_DELAY = 1500;
-function peerErrorMessage(type) {
-  switch (type) {
-    case 'network':
-    case 'server-error':
-    case 'socket-error':
-    case 'socket-closed':
-      return 'SIGNAL SERVER BLOCKED · TRY ANOTHER NETWORK';
-    case 'peer-unavailable':
-      return 'NO GAME FOUND · RE-CHECK CODE';
-    case 'webrtc':
-      return 'P2P CONNECTION FAILED · TRY ANOTHER NETWORK';
-    case 'browser-incompatible':
-      return 'BROWSER DOES NOT SUPPORT WEBRTC';
-    case 'ssl-unavailable':
-      return 'SECURE CONNECTION FAILED · REFRESH';
-    default:
-      return 'CONNECTION ERROR · TRY AGAIN';
-  }
+const NET_CONNECT_TIMEOUT = 20000;
+
+const NET_DEBUG = true;
+function netLog(...args) {
+  if (NET_DEBUG) console.log('%c[VOID.NET]', 'color:#7ec8e3;font-weight:bold', ...args);
 }
 
-// Attaches low-level ICE/connection-state logging to a DataConnection so a
-// NAT-traversal failure shows up clearly in the console instead of just
-// hanging on "CONNECTING…".
-function watchIce(conn, label, onFail) {
-  const attach = () => {
-    const pc = conn.peerConnection;
-    if (!pc) return;
-    pc.oniceconnectionstatechange = () => {
-      netLog(label, 'ICE state:', pc.iceConnectionState);
-      if (pc.iceConnectionState === 'failed' && onFail) onFail();
-    };
-    pc.onicecandidateerror = ev => netLog(label, 'ICE candidate error:', ev.errorText || ev.errorCode || ev);
-  };
-  if (conn.peerConnection) attach(); else conn.on('open', attach);
-}
+window.addEventListener('error', e =>
+  console.error('[VOID.ERROR]', e.message, e.filename + ':' + e.lineno)
+);
 
-// 3-letter room codes (A-Z, no I/O to avoid 1/0 confusion) — short enough
-// to read out loud for a quick 1v1, regenerated automatically if the
-// signaling server reports that ID is already taken.
 const CODE_LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+
 function makeRoomCode() {
   let s = '';
-  for (let i = 0; i < 3; i++) s += CODE_LETTERS[Math.floor(Math.random() * CODE_LETTERS.length)];
+  for (let i = 0; i < 3; i++) {
+    s += CODE_LETTERS[Math.floor(Math.random() * CODE_LETTERS.length)];
+  }
   return s;
 }
 
-// Host: creates a peer with a fixed ID derived from a random 3-letter room
-// code, so a joining client can connect directly without a relay lookup.
-function hostGame() {
-  if (typeof Peer === 'undefined') {
-    setStatus('ERROR: NETWORK LIBRARY FAILED TO LOAD');
-    console.error('[VOID.NET] PeerJS did not load. Check your internet connection, ad blocker, or content blocker — it loads from cdnjs.cloudflare.com.');
-    return;
+function cleanupNetwork() {
+  if (connectTimeout) {
+    clearTimeout(connectTimeout);
+    connectTimeout = null;
   }
-  localName = (document.getElementById('name-input').value.trim().toUpperCase() || 'GHOST').slice(0,12);
-  setStatus('CONNECTING…');
-  if (peer && !peer.destroyed) { netLog('Cleaning up previous peer before hosting'); peer.destroy(); }
-  attemptHost(0);
+  if (joinRetryTimer) {
+    clearInterval(joinRetryTimer);
+    joinRetryTimer = null;
+  }
+
+  if (peer && typeof peer.leave === 'function') {
+    try { peer.leave(); } catch (_) {}
+  }
+
+  peer = null;
+  netAction = null;
+  hostConn = null;
+  hostPeerId = '';
+  clientConns = {};
 }
 
-function attemptHost(retryCount) {
-  const code = makeRoomCode();
-  const fullId = 'VOID' + code;
-  netLog('Hosting attempt', retryCount + 1, '— code:', code, '(peer id:', fullId + ')');
-  const p = new Peer(fullId, PEER_OPTS);
-  peer = p;
+async function createRoom(roomCode) {
+  try {
+    trysteroMod = await window.VOID_TRYSTERO_READY;
+    const { joinRoom, selfId } = trysteroMod;
 
-  p.on('open', id => {
-    myId = id;
-    isHost = true;
-    document.getElementById('room-code-val').textContent = code;
-    document.getElementById('room-code-display').style.display = 'block';
-    setStatus('HOSTING · ' + code);
-    netLog('Signaling connected. Peer ID:', id, '— share code:', code, '— waiting for players…');
-    initMyPlayer();
-    startGame();
-    p.on('connection', conn => {
-      netLog('Incoming connection request from', conn.peer);
-      watchIce(conn, 'host→' + conn.peer);
-      conn.on('open', () => {
-        clientConns[conn.peer] = conn;
-        netLog('Data channel OPEN with', conn.peer);
-        conn.on('data', d => { netLog('recv ←', conn.peer, d); onHostReceive(conn.peer, d); });
-        conn.on('close', () => { netLog('Data channel CLOSED:', conn.peer); onClientDisconnected(conn.peer); });
-        conn.on('error', err => { netLog('Data channel ERROR:', conn.peer, err); onClientDisconnected(conn.peer); });
-      });
-    });
-  });
-  p.on('error', e => {
-    netLog('Peer error:', e.type, e);
-    if (e.type === 'unavailable-id' && retryCount < 5) {
-      netLog('Room code collision — generating a new code…');
-      p.destroy();
-      attemptHost(retryCount + 1);
-      return;
+    // The app ID is intentionally fixed so everyone uses the same discovery
+    // namespace. The room code keeps individual games separate.
+    const roomId = 'VOID-' + roomCode;
+
+    peer = joinRoom(
+      {
+        appId: 'com.void.fps.multiplayer.v3',
+        rtcConfig: { iceServers: ICE_SERVERS },
+      },
+      roomId,
+      {
+        onJoinError: details => {
+          console.error('[VOID.NET] Trystero join error:', details);
+          if (!gameRunning) {
+            setStatus('P2P BLOCKED · TRY ANOTHER NETWORK');
+          }
+        }
+      }
+    );
+
+    myId = selfId;
+
+    netAction = peer.makeAction('void-game-v3');
+
+    netAction.onMessage = (msg, meta) => {
+      if (!msg || !msg.t) return;
+
+      const senderId = meta && meta.peerId;
+      netLog('recv ←', senderId || '?', msg);
+
+      if (isHost) {
+        // Host receives JOIN/HIT and also sees direct STATE/SHOOT packets.
+        onHostReceive(senderId, msg);
+      } else {
+        onClientReceive(msg);
+      }
+    };
+
+    peer.onPeerJoin = peerId => {
+      netLog('Peer discovered:', peerId);
+
+      if (isHost) {
+        clientConns[peerId] = { peer: peerId };
+        return;
+      }
+
+      // We do not know which discovered peer is the host yet.
+      // Send JOIN directly to every newly discovered peer. The real host
+      // answers with WELCOME; other clients simply ignore the message.
+      if (!hostPeerId) {
+        sendToPeer(peerId, NET_MSG.JOIN, {
+          name: localName,
+          id: myId
+        });
+      }
+    };
+
+    peer.onPeerLeave = peerId => {
+      netLog('Peer left:', peerId);
+
+      if (isHost) {
+        onClientDisconnected(peerId);
+        return;
+      }
+
+      if (peerId === hostPeerId) {
+        onHostDisconnected();
+      }
+
+      delete players[peerId];
+      updateScoreboard();
+    };
+
+    return true;
+  } catch (err) {
+    console.error('[VOID.NET] Trystero setup failed:', err);
+    setStatus('NETWORK LIBRARY FAILED · REFRESH');
+    return false;
+  }
+}
+
+function sendToPeer(peerId, type, data) {
+  if (!netAction || !peerId) return;
+  try {
+    netAction.send({ t: type, d: data }, { target: peerId });
+  } catch (e) {
+    netLog('sendToPeer failed:', e);
+  }
+}
+
+function netSend(conn, type, data) {
+  const target = typeof conn === 'string' ? conn : conn && conn.peer;
+  if (target) sendToPeer(target, type, data);
+}
+
+function netBroadcast(type, data, exceptId) {
+  if (!netAction) return;
+
+  try {
+    // For the host we know the connected client IDs, so we can target them.
+    // For a client, a normal broadcast reaches the other peers in the room.
+    if (isHost) {
+      const targets = Object.keys(clientConns).filter(id => id !== exceptId);
+      if (targets.length) {
+        netAction.send({ t: type, d: data }, { target: targets });
+      }
+    } else {
+      netAction.send({ t: type, d: data });
     }
-    setStatus(peerErrorMessage(e.type));
-  });
-  p.on('disconnected', () => {
-    netLog('Disconnected from signaling server — attempting to reconnect (existing player data channels keep working meanwhile)…');
-    if (gameRunning) setStatus('RECONNECTING…');
-    if (!p.destroyed) p.reconnect();
-  });
-  p.on('close', () => {
-    netLog('Peer permanently closed — signaling socket cannot be reused, host must restart to get a new room code.');
-    if (gameRunning) showConnLostOverlay('SIGNALING CONNECTION CLOSED — RESTART TO HOST AGAIN');
-  });
+  } catch (e) {
+    netLog('broadcast failed:', e);
+  }
+}
+
+function hostSnapshot() {
+  const snapshot = [];
+
+  // Include the host itself.
+  if (me && myId) {
+    snapshot.push({
+      id: myId,
+      name: localName,
+      x: me.x,
+      y: me.y,
+      z: me.z,
+      yaw: me.yaw,
+      hp: me.hp,
+      kills: me.kills,
+      deaths: me.deaths
+    });
+  }
+
+  for (const [pid, p] of Object.entries(players)) {
+    if (pid === myId) continue;
+    snapshot.push({
+      id: pid,
+      name: p.name,
+      x: p.x,
+      y: p.y,
+      z: p.z,
+      yaw: p.yaw,
+      hp: p.hp,
+      kills: p.kills,
+      deaths: p.deaths
+    });
+  }
+
+  return snapshot;
+}
+
+async function hostGame() {
+  localName = (document.getElementById('name-input').value.trim().toUpperCase() || 'GHOST').slice(0,12);
+  setStatus('CONNECTING…');
+
+  cleanupNetwork();
+  isHost = true;
+  clientConns = {};
+
+  const code = makeRoomCode();
+  netLog('Hosting with Trystero/Nostr — room:', code);
+
+  const ok = await createRoom(code);
+  if (!ok) {
+    isHost = false;
+    return;
+  }
+
+  document.getElementById('room-code-val').textContent = code;
+  document.getElementById('room-code-display').style.display = 'block';
+  setStatus('HOSTING · ' + code);
+
+  initMyPlayer();
+  players[myId] = createNetPlayer(myId, localName, { x: me.x, z: me.z });
+  startGame();
+
+  netLog('Room ready. My peer ID:', myId);
 }
 
 function onClientDisconnected(peerId) {
-  if (!clientConns[peerId] && !players[peerId]) return; // already handled
+  if (!clientConns[peerId] && !players[peerId]) return;
+
   const name = players[peerId] ? players[peerId].name : 'PLAYER';
+
   netBroadcast(NET_MSG.LEAVE, { id: peerId });
   delete clientConns[peerId];
   delete players[peerId];
+
   updateScoreboard();
   if (gameRunning) showFeedMessage(name + ' DISCONNECTED');
 }
 
-function joinGame() {
-  if (typeof Peer === 'undefined') {
-    setStatus('ERROR: NETWORK LIBRARY FAILED TO LOAD');
-    console.error('[VOID.NET] PeerJS did not load. Check your internet connection, ad blocker, or content blocker — it loads from cdnjs.cloudflare.com.');
+async function joinGame() {
+  localName = (document.getElementById('name-input').value.trim().toUpperCase() || 'GHOST').slice(0,12);
+
+  const raw = document.getElementById('room-input').value.trim().toUpperCase();
+  if (!raw) {
+    setStatus('ENTER A ROOM CODE');
     return;
   }
-  localName = (document.getElementById('name-input').value.trim().toUpperCase() || 'GHOST').slice(0,12);
-  const raw = document.getElementById('room-input').value.trim().toUpperCase();
-  if (!raw) { setStatus('ENTER A ROOM CODE'); return; }
+
   setStatus('CONNECTING…');
-  if (peer && !peer.destroyed) { netLog('Cleaning up previous peer before joining'); peer.destroy(); }
-  const hostPeerId = 'VOID' + raw;
-  let finished = false;
-  let retryCount = 0;
-  let connectTimeout = null;
 
-  function clearJoinTimer() {
-    if (connectTimeout) { clearTimeout(connectTimeout); connectTimeout = null; }
-  }
+  cleanupNetwork();
+  isHost = false;
+  hostPeerId = '';
 
-  function startJoinPeer() {
-    if (peer && !peer.destroyed) {
-      try { peer.destroy(); } catch (_) {}
+  const ok = await createRoom(raw);
+  if (!ok) return;
+
+  setStatus('FINDING ROOM…');
+  netLog('Joined Trystero room:', 'VOID-' + raw, 'my peer:', myId);
+
+  // If the host is already visible, send immediately. Otherwise onPeerJoin
+  // will do it when discovery finds the host.
+  const sendJoin = () => {
+    if (hostPeerId) return;
+
+    try {
+      // Trystero's internal peer list is not part of the public API, so the
+      // reliable method is to broadcast JOIN. The host will receive it.
+      netAction.send({
+        t: NET_MSG.JOIN,
+        d: { name: localName, id: myId }
+      });
+    } catch (e) {
+      netLog('JOIN broadcast failed:', e);
     }
+  };
 
-    netLog('Creating join peer', retryCount + 1, 'using PeerJS Cloud 0.peerjs.com:443');
-    const p = new Peer(null, PEER_OPTS);
-    peer = p;
+  sendJoin();
 
-    connectTimeout = setTimeout(() => {
-      if (finished) return;
-      netLog('Join timeout. Signalling or P2P handshake did not complete.');
-      setStatus('TIMED OUT · CHECK CODE OR TRY ANOTHER NETWORK');
-      try { if (!p.destroyed) p.destroy(); } catch (_) {}
-    }, NET_CONNECT_TIMEOUT);
+  // Retry JOIN while discovery is happening. This handles a room where the
+  // host was already present before this browser finished connecting.
+  joinRetryTimer = setInterval(() => {
+    if (gameRunning || hostPeerId) {
+      clearInterval(joinRetryTimer);
+      joinRetryTimer = null;
+      return;
+    }
+    sendJoin();
+  }, 1200);
 
-    p.on('open', id => {
-      if (finished) return;
-      myId = id;
-      netLog('Signaling connected. My peer ID:', id, '— connecting to', hostPeerId);
-      const conn = p.connect(hostPeerId, { reliable: true, serialization: 'json' });
-      hostConn = conn;
-      watchIce(conn, 'client→host', () => {
-        if (!gameRunning) setStatus('P2P BLOCKED · TRY ANOTHER NETWORK');
-      });
-      conn.on('open', () => {
-        finished = true;
-        clearJoinTimer();
-        setStatus('CONNECTED · WAITING…');
-        netLog('Data channel OPEN with host', hostPeerId);
-        netSend(conn, NET_MSG.JOIN, { name: localName, id: myId });
-      });
-      conn.on('data', d => { netLog('recv ←', d); onClientReceive(d); });
-      conn.on('close', () => {
-        if (finished) { netLog('Data channel CLOSED (host)'); onHostDisconnected(); }
-      });
-      conn.on('error', err => {
-        netLog('Data channel ERROR:', err);
-        if (!finished) setStatus('P2P CONNECTION FAILED · TRY AGAIN');
-      });
-    });
-
-    p.on('error', e => {
-      netLog('Peer error:', e.type, e);
-      if (finished) return;
-      clearJoinTimer();
-
-      // A missing room is definitive; retrying cannot create it.
-      if (e.type === 'peer-unavailable') {
-        setStatus('NO GAME FOUND · RE-CHECK CODE');
-        return;
-      }
-
-      // Signalling/socket failures are commonly caused by a firewall, VPN,
-      // school/work proxy, captive portal, or temporary network drop. Give the
-      // browser a couple of clean retries before reporting the problem.
-      if ((e.type === 'network' || e.type === 'server-error' || e.type === 'socket-error' || e.type === 'socket-closed') && retryCount < 2) {
-        retryCount++;
-        setStatus('RETRYING CONNECTION…');
-        setTimeout(() => { if (!finished) startJoinPeer(); }, NET_RETRY_DELAY);
-        return;
-      }
-
-      setStatus(peerErrorMessage(e.type));
-    });
-
-    p.on('disconnected', () => {
-      netLog('Disconnected from signaling server.');
-      if (finished) {
-        if (gameRunning) setStatus('RECONNECTING…');
-        if (!p.destroyed) p.reconnect();
-      }
-    });
-    p.on('close', () => netLog('Peer permanently closed'));
-  }
-
-  startJoinPeer();
+  connectTimeout = setTimeout(() => {
+    if (!gameRunning) {
+      setStatus('NO CONNECTION · TRY A DIFFERENT NETWORK');
+      netLog('Timed out waiting for a host/WELCOME');
+    }
+  }, NET_CONNECT_TIMEOUT);
 }
 
 function onHostDisconnected() {
-  if (!gameRunning) { setStatus('DISCONNECTED'); return; }
+  if (!gameRunning) {
+    setStatus('DISCONNECTED');
+    return;
+  }
   showConnLostOverlay('HOST LEFT OR CONNECTION DROPPED');
 }
 
 function onHostReceive(senderId, msg) {
+  if (!senderId || !msg) return;
+
   switch(msg.t) {
     case NET_MSG.JOIN: {
-      netLog('Player joined:', msg.d.name, '(' + senderId + ')');
-      // Send welcome with full game state
+      if (senderId === myId) return;
+
+      clientConns[senderId] = { peer: senderId };
+
+      const name = String(msg.d?.name || 'GHOST').slice(0, 12);
+      netLog('Player joined:', name, '(' + senderId + ')');
+
       const sp = randomSpawn(Object.keys(players).length);
-      players[senderId] = createNetPlayer(senderId, msg.d.name, sp);
+      players[senderId] = createNetPlayer(senderId, name, sp);
+
       const welcome = {
         yourId: senderId,
-        players: Object.entries(players).map(([pid,p]) => ({
-          id: pid, name: p.name, x: p.x, y: p.y, z: p.z,
-          yaw: p.yaw, hp: p.hp, kills: p.kills, deaths: p.deaths
-        })),
-        spawnX: sp.x, spawnZ: sp.z
+        hostId: myId,
+        players: hostSnapshot(),
+        spawnX: sp.x,
+        spawnZ: sp.z
       };
-      netSend(clientConns[senderId], NET_MSG.WELCOME, welcome);
+
+      sendToPeer(senderId, NET_MSG.WELCOME, welcome);
+
       netBroadcast(NET_MSG.STATE, {
-        id: senderId, name: msg.d.name, x: sp.x, z: sp.z, hp: MAX_HP, kills:0, deaths:0
+        id: senderId,
+        name,
+        x: sp.x,
+        y: EYE_H,
+        z: sp.z,
+        yaw: 0,
+        pitch: 0,
+        hp: MAX_HP,
+        kills: 0,
+        deaths: 0,
+        cr: false
       }, senderId);
-      showFeedMessage(msg.d.name + ' JOINED');
+
+      showFeedMessage(name + ' JOINED');
       updateScoreboard();
       break;
     }
+
     case NET_MSG.STATE: {
-      if (players[senderId]) {
-        players[senderId].netX = msg.d.x;
-        players[senderId].netZ = msg.d.z;
-        players[senderId].netY = msg.d.y;
-        players[senderId].yaw  = msg.d.yaw;
-        players[senderId].pitch = msg.d.pitch;
-        players[senderId].crouching = msg.d.cr;
-      }
-      netBroadcast(NET_MSG.STATE, { ...msg.d, id: senderId }, senderId);
+      if (senderId === myId || !players[senderId]) return;
+
+      players[senderId].netX = msg.d.x;
+      players[senderId].netZ = msg.d.z;
+      players[senderId].netY = msg.d.y;
+      players[senderId].yaw  = msg.d.yaw;
+      players[senderId].pitch = msg.d.pitch;
+      players[senderId].crouching = msg.d.cr;
+
+      // Trystero already delivers this packet directly to every client.
+      // Do not relay it through the host or clients would see duplicates.
       break;
     }
+
     case NET_MSG.SHOOT: {
-      netBroadcast(NET_MSG.SHOOT, { ...msg.d, id: senderId }, senderId);
+      // The shooter packet is already direct P2P. The host only needs the
+      // visual effect for itself.
+      if (senderId !== myId) spawnBulletEffect(msg.d);
       break;
     }
+
     case NET_MSG.HIT: {
+      // Only the host receives damage requests. This prevents clients from
+      // applying their own local damage and keeps the host authoritative.
       const target = msg.d.targetId;
+
       if (players[target]) {
         players[target].hp -= msg.d.dmg;
+
         if (players[target].hp <= 0) {
           players[target].hp = 0;
           players[target].deaths++;
-          players[senderId] && players[senderId].kills++;
-          // broadcast die
-          const dieMsg = { victimId: target, killerId: senderId,
+          if (players[senderId]) players[senderId].kills++;
+
+          const dieMsg = {
+            victimId: target,
+            killerId: senderId,
             victimName: players[target].name,
-            killerName: players[senderId]?.name || '?' };
+            killerName: players[senderId]?.name || '?'
+          };
+
           netBroadcast(NET_MSG.DIE, dieMsg);
-          netSend(clientConns[senderId], NET_MSG.DIE, dieMsg);
-          if (clientConns[target]) netSend(clientConns[target], NET_MSG.DIE, dieMsg);
-          // respawn after delay
+
           setTimeout(() => {
+            if (!players[target]) return;
+
             const sp2 = randomSpawn(Math.floor(Math.random()*7));
             players[target].hp = MAX_HP;
             players[target].x = sp2.x;
             players[target].z = sp2.z;
-            const rMsg = { id: target, x: sp2.x, z: sp2.z };
-            netBroadcast(NET_MSG.RESPAWN, rMsg);
-            if (clientConns[target]) netSend(clientConns[target], NET_MSG.RESPAWN, rMsg);
+            players[target].netX = sp2.x;
+            players[target].netZ = sp2.z;
+
+            netBroadcast(NET_MSG.RESPAWN, {
+              id: target,
+              x: sp2.x,
+              z: sp2.z
+            });
           }, RESPAWN_SEC * 1000);
         } else {
-          // relay damage to target
-          if (clientConns[target]) netSend(clientConns[target], NET_MSG.HIT, { dmg: msg.d.dmg, fromId: senderId });
-          netBroadcast(NET_MSG.HIT, { targetId: target, dmg: msg.d.dmg }, senderId);
+          netBroadcast(NET_MSG.HIT, {
+            dmg: msg.d.dmg,
+            fromId: senderId,
+            targetId: target
+          });
         }
       }
+
       updateScoreboard();
       break;
     }
@@ -784,22 +903,54 @@ function onClientReceive(msg) {
   switch(msg.t) {
     case NET_MSG.WELCOME: {
       const d = msg.d;
+
+      clearTimeout(connectTimeout);
+      connectTimeout = null;
+
+      if (joinRetryTimer) {
+        clearInterval(joinRetryTimer);
+        joinRetryTimer = null;
+      }
+
+      hostPeerId = d.hostId;
+      hostConn = { peer: hostPeerId };
+
       d.players.forEach(p => {
-        if (p.id !== d.yourId) {
-          players[p.id] = createNetPlayer(p.id, p.name, { x: p.x, z: p.z });
-          players[p.id].kills  = p.kills;
-          players[p.id].deaths = p.deaths;
+        if (p.id !== myId) {
+          players[p.id] = createNetPlayer(
+            p.id,
+            p.name || '?',
+            { x: p.x, z: p.z }
+          );
+          players[p.id].kills = p.kills || 0;
+          players[p.id].deaths = p.deaths || 0;
+          players[p.id].hp = p.hp ?? MAX_HP;
+          players[p.id].yaw = p.yaw || 0;
         }
       });
+
       initMyPlayer(d.spawnX, d.spawnZ);
+      setStatus('CONNECTED · STARTING…');
       startGame();
       updateScoreboard();
+
+      netLog('WELCOME received. Host:', hostPeerId);
       break;
     }
+
     case NET_MSG.STATE: {
       const d = msg.d;
       if (d.id === myId) return;
-      if (!players[d.id]) players[d.id] = createNetPlayer(d.id, d.name || '?', { x: d.x, z: d.z });
+
+      if (!players[d.id]) {
+        players[d.id] = createNetPlayer(
+          d.id,
+          d.name || '?',
+          { x: d.x, z: d.z }
+        );
+      }
+
+      if (d.name) players[d.id].name = d.name;
       players[d.id].netX = d.x;
       players[d.id].netZ = d.z;
       players[d.id].netY = d.y;
@@ -808,32 +959,44 @@ function onClientReceive(msg) {
       players[d.id].crouching = d.cr;
       break;
     }
+
     case NET_MSG.SHOOT: {
       if (msg.d.id !== myId) spawnBulletEffect(msg.d);
       break;
     }
+
     case NET_MSG.HIT: {
-      // We were hit
-      takeDamage(msg.d.dmg);
+      // Only authoritative host damage packets contain fromId + targetId.
+      // Ignore our own outbound hit request if it ever reaches us.
+      if (msg.d.targetId && msg.d.targetId !== myId) return;
+      if (msg.d.targetId === myId || msg.d.fromId) {
+        takeDamage(msg.d.dmg);
+      }
       break;
     }
+
     case NET_MSG.DIE: {
       const d = msg.d;
+
       if (d.victimId === myId) {
         onLocalDeath(d.killerName);
       }
+
       if (d.killerId === myId) {
         me.kills++;
         showKillFeed(d.killerName, d.victimName, true);
       } else {
         showKillFeed(d.killerName, d.victimName, false);
       }
+
       if (players[d.victimId]) players[d.victimId].hp = 0;
       updateScoreboard();
       break;
     }
+
     case NET_MSG.RESPAWN: {
       const d = msg.d;
+
       if (d.id === myId) {
         onLocalRespawn(d.x, d.z);
       } else if (players[d.id]) {
@@ -843,6 +1006,7 @@ function onClientReceive(msg) {
       }
       break;
     }
+
     case NET_MSG.LEAVE: {
       delete players[msg.d.id];
       updateScoreboard();
@@ -1283,13 +1447,9 @@ function tryShoot() {
   // Raycast to find hit
   const hit = raycastShoot(me.x, me.y, me.z, shootYaw, shootPitch);
 
-  // Broadcast shoot
-  const shootData = { x: me.x, y: me.y, z: me.z, yaw: shootYaw, pitch: shootPitch };
-  if (isHost) {
-    netBroadcast(NET_MSG.SHOOT, { ...shootData, id: myId });
-  } else if (hostConn) {
-    netSend(hostConn, NET_MSG.SHOOT, shootData);
-  }
+  // Trystero sends the visual shot directly to every peer.
+  const shootData = { x: me.x, y: me.y, z: me.z, yaw: shootYaw, pitch: shootPitch, id: myId };
+  netBroadcast(NET_MSG.SHOOT, shootData);
 
   if (hit) {
     showHitMarker();
@@ -1321,6 +1481,8 @@ function tryShoot() {
         updateScoreboard();
       }
     } else if (hostConn) {
+      // Damage requests go only to the host. The host sends the authoritative
+      // HIT/DIE result back to everyone.
       netSend(hostConn, NET_MSG.HIT, { targetId: hit.id, dmg: RIFLE_DMG });
     }
   }
@@ -1532,14 +1694,18 @@ function syncState(now) {
     id: myId, x: me.x, z: me.z, y: me.y,
     yaw: me.yaw, pitch: me.pitch, cr: me.crouching,
   };
+  // Movement is safe to send directly in the mesh; the host no longer needs
+  // to relay every position packet.
   if (isHost) {
-    netBroadcast(NET_MSG.STATE, stateData);
-    // update host self in players for scoring display
-    players[myId] = players[myId] || {};
+    netBroadcast(NET_MSG.STATE, { ...stateData, name: localName });
+    players[myId] = players[myId] || createNetPlayer(myId, localName, {x: me.x, z: me.z});
+    players[myId].x = me.x;
+    players[myId].z = me.z;
     players[myId].kills  = me.kills;
     players[myId].deaths = me.deaths;
-  } else if (hostConn) {
-    netSend(hostConn, NET_MSG.STATE, stateData);
+    players[myId].hp = me.hp;
+  } else if (netAction) {
+    netBroadcast(NET_MSG.STATE, { ...stateData, name: localName });
   }
 }
 
