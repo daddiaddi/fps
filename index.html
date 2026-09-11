@@ -455,9 +455,13 @@ const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
   { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun.cloudflare.com:3478' },
+  { urls: 'stun:global.stun.twilio.com:3478' },
   { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
   { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
   { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:relay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:relay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
 ];
 const PEER_OPTS = { debug: 0, config: { iceServers: ICE_SERVERS } };
 
@@ -497,6 +501,7 @@ function hostGame() {
   }
   localName = (document.getElementById('name-input').value.trim().toUpperCase() || 'GHOST').slice(0,12);
   setStatus('CONNECTING…');
+  if (peer && !peer.destroyed) { netLog('Cleaning up previous peer before hosting'); peer.destroy(); }
   attemptHost(0);
 }
 
@@ -539,8 +544,13 @@ function attemptHost(retryCount) {
     setStatus('ERROR: ' + e.type);
   });
   p.on('disconnected', () => {
-    netLog('Disconnected from signaling server (data channels to already-connected players keep working)');
+    netLog('Disconnected from signaling server — attempting to reconnect (existing player data channels keep working meanwhile)…');
     if (gameRunning) setStatus('RECONNECTING…');
+    if (!p.destroyed) p.reconnect();
+  });
+  p.on('close', () => {
+    netLog('Peer permanently closed — signaling socket cannot be reused, host must restart to get a new room code.');
+    if (gameRunning) showConnLostOverlay('SIGNALING CONNECTION CLOSED — RESTART TO HOST AGAIN');
   });
 }
 
@@ -564,6 +574,7 @@ function joinGame() {
   const raw = document.getElementById('room-input').value.trim().toUpperCase();
   if (!raw) { setStatus('ENTER A ROOM CODE'); return; }
   setStatus('CONNECTING…');
+  if (peer && !peer.destroyed) { netLog('Cleaning up previous peer before joining'); peer.destroy(); }
   peer = new Peer(null, PEER_OPTS);
 
   // Fail loudly if the handshake never completes instead of hanging forever
@@ -578,7 +589,7 @@ function joinGame() {
     const conn = peer.connect(hostPeerId, { reliable: true, serialization: 'json' });
     hostConn = conn;
     watchIce(conn, 'client→host', () => {
-      if (!gameRunning) setStatus('NETWORK BLOCKED P2P · TRY A DIFFERENT NETWORK');
+      if (!gameRunning) setStatus('P2P BLOCKED · TRY SAME WIFI OR A DIFFERENT NETWORK');
     });
     conn.on('open', () => {
       clearTimeout(connectTimeout);
@@ -593,9 +604,16 @@ function joinGame() {
   peer.on('error', e => {
     netLog('Peer error:', e.type, e);
     clearTimeout(connectTimeout);
-    setStatus(e.type === 'peer-unavailable' ? 'NO GAME FOUND · CHECK CODE' : 'ERROR: ' + e.type);
+    setStatus(e.type === 'peer-unavailable'
+      ? 'NO GAME FOUND · RE-CHECK CODE, HOST MAY HAVE DROPPED'
+      : 'ERROR: ' + e.type);
   });
-  peer.on('disconnected', () => { netLog('Disconnected from signaling server'); if (gameRunning) setStatus('RECONNECTING…'); });
+  peer.on('disconnected', () => {
+    netLog('Disconnected from signaling server — attempting to reconnect…');
+    if (gameRunning) setStatus('RECONNECTING…');
+    if (peer && !peer.destroyed) peer.reconnect();
+  });
+  peer.on('close', () => netLog('Peer permanently closed'));
 }
 
 function onHostDisconnected() {
