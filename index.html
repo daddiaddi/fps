@@ -444,6 +444,39 @@ function netLog(...args) {
 }
 window.addEventListener('error', e => console.error('[VOID.ERROR]', e.message, e.filename + ':' + e.lineno));
 
+// PeerJS's built-in default ICE config relies on its own TURN relay as a
+// NAT-traversal fallback. That's the most likely source of a
+// "failed to load resource ... certificate invalid" error in the console —
+// either that relay is having cert problems, or something on the local
+// network (antivirus TLS inspection, a school/corporate proxy) is
+// intercepting the connection. Supplying our own well-known STUN servers
+// plus a public TURN relay avoids PeerJS's default entirely.
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+];
+const PEER_OPTS = { debug: 0, config: { iceServers: ICE_SERVERS } };
+
+// Attaches low-level ICE/connection-state logging to a DataConnection so a
+// NAT-traversal failure shows up clearly in the console instead of just
+// hanging on "CONNECTING…".
+function watchIce(conn, label, onFail) {
+  const attach = () => {
+    const pc = conn.peerConnection;
+    if (!pc) return;
+    pc.oniceconnectionstatechange = () => {
+      netLog(label, 'ICE state:', pc.iceConnectionState);
+      if (pc.iceConnectionState === 'failed' && onFail) onFail();
+    };
+    pc.onicecandidateerror = ev => netLog(label, 'ICE candidate error:', ev.errorText || ev.errorCode || ev);
+  };
+  if (conn.peerConnection) attach(); else conn.on('open', attach);
+}
+
 // 3-letter room codes (A-Z, no I/O to avoid 1/0 confusion) — short enough
 // to read out loud for a quick 1v1, regenerated automatically if the
 // signaling server reports that ID is already taken.
@@ -471,7 +504,7 @@ function attemptHost(retryCount) {
   const code = makeRoomCode();
   const fullId = 'VOID' + code;
   netLog('Hosting attempt', retryCount + 1, '— code:', code, '(peer id:', fullId + ')');
-  const p = new Peer(fullId, { debug: 0 });
+  const p = new Peer(fullId, PEER_OPTS);
   peer = p;
 
   p.on('open', id => {
@@ -485,6 +518,7 @@ function attemptHost(retryCount) {
     startGame();
     p.on('connection', conn => {
       netLog('Incoming connection request from', conn.peer);
+      watchIce(conn, 'host→' + conn.peer);
       conn.on('open', () => {
         clientConns[conn.peer] = conn;
         netLog('Data channel OPEN with', conn.peer);
@@ -530,7 +564,7 @@ function joinGame() {
   const raw = document.getElementById('room-input').value.trim().toUpperCase();
   if (!raw) { setStatus('ENTER A ROOM CODE'); return; }
   setStatus('CONNECTING…');
-  peer = new Peer(null, { debug: 0 });
+  peer = new Peer(null, PEER_OPTS);
 
   // Fail loudly if the handshake never completes instead of hanging forever
   const connectTimeout = setTimeout(() => {
@@ -543,6 +577,9 @@ function joinGame() {
     netLog('Signaling connected. My peer ID:', id, '— connecting to', hostPeerId);
     const conn = peer.connect(hostPeerId, { reliable: true, serialization: 'json' });
     hostConn = conn;
+    watchIce(conn, 'client→host', () => {
+      if (!gameRunning) setStatus('NETWORK BLOCKED P2P · TRY A DIFFERENT NETWORK');
+    });
     conn.on('open', () => {
       clearTimeout(connectTimeout);
       setStatus('CONNECTED · WAITING…');
