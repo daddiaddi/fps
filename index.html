@@ -471,6 +471,8 @@ const ICE_SERVERS = [
   { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
   { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
   { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turns:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:staticauth.openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
   { urls: 'turn:relay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
   { urls: 'turn:relay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
 ];
@@ -529,7 +531,12 @@ async function createRoom(roomCode) {
     peer = joinRoom(
       {
         appId: 'com.void.fps.multiplayer.v3',
-        rtcConfig: { iceServers: ICE_SERVERS },
+        rtcConfig: {
+          iceServers: ICE_SERVERS,
+          iceTransportPolicy: 'all',
+          bundlePolicy: 'max-bundle',
+          rtcpMuxPolicy: 'require'
+        },
       },
       roomId,
       {
@@ -546,6 +553,7 @@ async function createRoom(roomCode) {
 
     netAction = peer.makeAction('void-game-v3');
 
+    // Log WebRTC transport state so a school firewall failure is visible.
     netAction.onMessage = (msg, meta) => {
       if (!msg || !msg.t) return;
 
@@ -578,6 +586,20 @@ async function createRoom(roomCode) {
         });
       }
     };
+
+    // Quick local ICE probe. This does not connect to the game; it only tells us
+    // whether the browser can obtain a TURN relay candidate on the current network.
+    try {
+      const probe = new RTCPeerConnection({ iceServers: ICE_SERVERS, iceTransportPolicy: 'all' });
+      probe.createDataChannel('probe');
+      probe.onicecandidate = ev => {
+        if (!ev.candidate) { probe.close(); return; }
+        const c = ev.candidate.candidate || '';
+        if (c.includes('typ relay')) netLog('TURN relay candidate available:', c);
+      };
+      probe.createOffer().then(o => probe.setLocalDescription(o)).catch(() => probe.close());
+      setTimeout(() => { try { probe.close(); } catch (_) {} }, 8000);
+    } catch (_) {}
 
     peer.onPeerLeave = peerId => {
       netLog('Peer left:', peerId);
@@ -717,8 +739,8 @@ async function joinGame() {
   localName = (document.getElementById('name-input').value.trim().toUpperCase() || 'GHOST').slice(0,12);
 
   const raw = document.getElementById('room-input').value.trim().toUpperCase();
-  if (!raw) {
-    setStatus('ENTER A ROOM CODE');
+  if (!/^[A-Z]{3}$/.test(raw)) {
+    setStatus('ENTER THE 3-LETTER ROOM CODE');
     return;
   }
 
@@ -766,7 +788,7 @@ async function joinGame() {
 
   connectTimeout = setTimeout(() => {
     if (!gameRunning) {
-      setStatus('NO CONNECTION · TRY A DIFFERENT NETWORK');
+      setStatus('NO CONNECTION · FIREWALL MAY BLOCK WEBRTC');
       netLog('Timed out waiting for a host/WELCOME');
     }
   }, NET_CONNECT_TIMEOUT);
