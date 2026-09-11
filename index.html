@@ -318,7 +318,7 @@
   <div id="conn-lost-btn" onclick="location.reload()">RETURN TO LOBBY</div>
 </div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.2/peerjs.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.5/peerjs.min.js"></script>
 <script>
 'use strict';
 
@@ -463,7 +463,43 @@ const ICE_SERVERS = [
   { urls: 'turn:relay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
   { urls: 'turn:relay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
 ];
-const PEER_OPTS = { debug: 0, config: { iceServers: ICE_SERVERS } };
+// Use PeerJS Cloud explicitly over HTTPS/WSS on port 443. This removes any
+// ambiguity about which signalling server the browser is trying to reach.
+// PeerJS Cloud is only the signalling service; TURN below handles difficult
+// NAT cases once signalling succeeds.
+const PEER_OPTS = {
+  host: '0.peerjs.com',
+  port: 443,
+  path: '/',
+  secure: true,
+  debug: 1,
+  config: {
+    iceServers: ICE_SERVERS,
+    sdpSemantics: 'unified-plan'
+  }
+};
+
+const NET_CONNECT_TIMEOUT = 15000;
+const NET_RETRY_DELAY = 1500;
+function peerErrorMessage(type) {
+  switch (type) {
+    case 'network':
+    case 'server-error':
+    case 'socket-error':
+    case 'socket-closed':
+      return 'SIGNAL SERVER BLOCKED · TRY ANOTHER NETWORK';
+    case 'peer-unavailable':
+      return 'NO GAME FOUND · RE-CHECK CODE';
+    case 'webrtc':
+      return 'P2P CONNECTION FAILED · TRY ANOTHER NETWORK';
+    case 'browser-incompatible':
+      return 'BROWSER DOES NOT SUPPORT WEBRTC';
+    case 'ssl-unavailable':
+      return 'SECURE CONNECTION FAILED · REFRESH';
+    default:
+      return 'CONNECTION ERROR · TRY AGAIN';
+  }
+}
 
 // Attaches low-level ICE/connection-state logging to a DataConnection so a
 // NAT-traversal failure shows up clearly in the console instead of just
@@ -541,7 +577,7 @@ function attemptHost(retryCount) {
       attemptHost(retryCount + 1);
       return;
     }
-    setStatus('ERROR: ' + e.type);
+    setStatus(peerErrorMessage(e.type));
   });
   p.on('disconnected', () => {
     netLog('Disconnected from signaling server — attempting to reconnect (existing player data channels keep working meanwhile)…');
@@ -575,45 +611,92 @@ function joinGame() {
   if (!raw) { setStatus('ENTER A ROOM CODE'); return; }
   setStatus('CONNECTING…');
   if (peer && !peer.destroyed) { netLog('Cleaning up previous peer before joining'); peer.destroy(); }
-  peer = new Peer(null, PEER_OPTS);
+  const hostPeerId = 'VOID' + raw;
+  let finished = false;
+  let retryCount = 0;
+  let connectTimeout = null;
 
-  // Fail loudly if the handshake never completes instead of hanging forever
-  const connectTimeout = setTimeout(() => {
-    if (!gameRunning) setStatus('TIMED OUT · CHECK CODE & TRY AGAIN');
-  }, 12000);
+  function clearJoinTimer() {
+    if (connectTimeout) { clearTimeout(connectTimeout); connectTimeout = null; }
+  }
 
-  peer.on('open', id => {
-    myId = id;
-    const hostPeerId = 'VOID' + raw;
-    netLog('Signaling connected. My peer ID:', id, '— connecting to', hostPeerId);
-    const conn = peer.connect(hostPeerId, { reliable: true, serialization: 'json' });
-    hostConn = conn;
-    watchIce(conn, 'client→host', () => {
-      if (!gameRunning) setStatus('P2P BLOCKED · TRY SAME WIFI OR A DIFFERENT NETWORK');
+  function startJoinPeer() {
+    if (peer && !peer.destroyed) {
+      try { peer.destroy(); } catch (_) {}
+    }
+
+    netLog('Creating join peer', retryCount + 1, 'using PeerJS Cloud 0.peerjs.com:443');
+    const p = new Peer(null, PEER_OPTS);
+    peer = p;
+
+    connectTimeout = setTimeout(() => {
+      if (finished) return;
+      netLog('Join timeout. Signalling or P2P handshake did not complete.');
+      setStatus('TIMED OUT · CHECK CODE OR TRY ANOTHER NETWORK');
+      try { if (!p.destroyed) p.destroy(); } catch (_) {}
+    }, NET_CONNECT_TIMEOUT);
+
+    p.on('open', id => {
+      if (finished) return;
+      myId = id;
+      netLog('Signaling connected. My peer ID:', id, '— connecting to', hostPeerId);
+      const conn = p.connect(hostPeerId, { reliable: true, serialization: 'json' });
+      hostConn = conn;
+      watchIce(conn, 'client→host', () => {
+        if (!gameRunning) setStatus('P2P BLOCKED · TRY ANOTHER NETWORK');
+      });
+      conn.on('open', () => {
+        finished = true;
+        clearJoinTimer();
+        setStatus('CONNECTED · WAITING…');
+        netLog('Data channel OPEN with host', hostPeerId);
+        netSend(conn, NET_MSG.JOIN, { name: localName, id: myId });
+      });
+      conn.on('data', d => { netLog('recv ←', d); onClientReceive(d); });
+      conn.on('close', () => {
+        if (finished) { netLog('Data channel CLOSED (host)'); onHostDisconnected(); }
+      });
+      conn.on('error', err => {
+        netLog('Data channel ERROR:', err);
+        if (!finished) setStatus('P2P CONNECTION FAILED · TRY AGAIN');
+      });
     });
-    conn.on('open', () => {
-      clearTimeout(connectTimeout);
-      setStatus('CONNECTED · WAITING…');
-      netLog('Data channel OPEN with host', hostPeerId);
-      netSend(conn, NET_MSG.JOIN, { name: localName, id: myId });
+
+    p.on('error', e => {
+      netLog('Peer error:', e.type, e);
+      if (finished) return;
+      clearJoinTimer();
+
+      // A missing room is definitive; retrying cannot create it.
+      if (e.type === 'peer-unavailable') {
+        setStatus('NO GAME FOUND · RE-CHECK CODE');
+        return;
+      }
+
+      // Signalling/socket failures are commonly caused by a firewall, VPN,
+      // school/work proxy, captive portal, or temporary network drop. Give the
+      // browser a couple of clean retries before reporting the problem.
+      if ((e.type === 'network' || e.type === 'server-error' || e.type === 'socket-error' || e.type === 'socket-closed') && retryCount < 2) {
+        retryCount++;
+        setStatus('RETRYING CONNECTION…');
+        setTimeout(() => { if (!finished) startJoinPeer(); }, NET_RETRY_DELAY);
+        return;
+      }
+
+      setStatus(peerErrorMessage(e.type));
     });
-    conn.on('data', d => { netLog('recv ←', d); onClientReceive(d); });
-    conn.on('close', () => { netLog('Data channel CLOSED (host)'); onHostDisconnected(); });
-    conn.on('error', err => { netLog('Data channel ERROR:', err); setStatus('CONNECTION ERROR · TRY AGAIN'); });
-  });
-  peer.on('error', e => {
-    netLog('Peer error:', e.type, e);
-    clearTimeout(connectTimeout);
-    setStatus(e.type === 'peer-unavailable'
-      ? 'NO GAME FOUND · RE-CHECK CODE, HOST MAY HAVE DROPPED'
-      : 'ERROR: ' + e.type);
-  });
-  peer.on('disconnected', () => {
-    netLog('Disconnected from signaling server — attempting to reconnect…');
-    if (gameRunning) setStatus('RECONNECTING…');
-    if (peer && !peer.destroyed) peer.reconnect();
-  });
-  peer.on('close', () => netLog('Peer permanently closed'));
+
+    p.on('disconnected', () => {
+      netLog('Disconnected from signaling server.');
+      if (finished) {
+        if (gameRunning) setStatus('RECONNECTING…');
+        if (!p.destroyed) p.reconnect();
+      }
+    });
+    p.on('close', () => netLog('Peer permanently closed'));
+  }
+
+  startJoinPeer();
 }
 
 function onHostDisconnected() {
