@@ -246,7 +246,7 @@
     <input class="field-input" id="name-input" maxlength="12" placeholder="GHOST" spellcheck="false">
 
     <div class="field-label">ROOM CODE  <span style="color:#2a2a2a">(leave blank to host)</span></div>
-    <input class="field-input" id="room-input" maxlength="8" placeholder="ENTER CODE TO JOIN" spellcheck="false" style="text-transform:uppercase">
+    <input class="field-input" id="room-input" maxlength="3" placeholder="3-LETTER CODE" spellcheck="false" style="text-transform:uppercase">
 
     <div class="btn-row">
       <button class="btn btn-host" onclick="hostGame()">HOST</button>
@@ -375,12 +375,28 @@ function isWall(mx, mz) {
   return MAP_DATA[r][c] !== 0;
 }
 
+// Spawn points must land on open floor (value 0) at least CELL*1.5 in from
+// any border wall — using 1.8 for the corner points previously put them at
+// map cell (0,0)/(0,13)/(11,0), i.e. INSIDE the outer wall ring, which is
+// why players spawned stuck in solid geometry and couldn't move.
 const SPAWN_POINTS = [
-  { x: 1.8, z: 1.8 }, { x: (COLS-2)*CELL-0.8, z: (ROWS-2)*CELL-0.8 },
-  { x: 1.8, z: (ROWS-2)*CELL-0.8 }, { x: (COLS-2)*CELL-0.8, z: 1.8 },
-  { x: COLS/2*CELL, z: ROWS/2*CELL },
-  { x: 2.5, z: ROWS/2*CELL }, { x: (COLS-2.5)*CELL, z: ROWS/2*CELL },
+  { x: CELL * 1.5, z: CELL * 1.5 },                                   // top-left
+  { x: (COLS-2)*CELL - CELL*0.5, z: (ROWS-2)*CELL - CELL*0.5 },       // bottom-right
+  { x: CELL * 1.5, z: (ROWS-2)*CELL - CELL*0.5 },                     // bottom-left
+  { x: (COLS-2)*CELL - CELL*0.5, z: CELL * 1.5 },                     // top-right
+  { x: COLS/2*CELL, z: ROWS/2*CELL },                                 // center
+  { x: CELL * 1.5, z: ROWS/2*CELL },                                  // left-mid
+  { x: (COLS-2.5)*CELL, z: ROWS/2*CELL },                             // right-mid
 ];
+
+// Sanity-check every spawn point on load so a future map/constant edit
+// can't silently reintroduce an in-wall spawn.
+SPAWN_POINTS.forEach((sp, i) => {
+  if (isWall(sp.x, sp.z)) {
+    console.error(`[VOID.MAP] Spawn point ${i} is inside a wall!`, sp,
+      '→ cell', [Math.floor(sp.z/CELL), Math.floor(sp.x/CELL)]);
+  }
+});
 
 function randomSpawn(idx) {
   return SPAWN_POINTS[idx % SPAWN_POINTS.length];
@@ -409,7 +425,7 @@ const NET_MSG = {
 };
 
 function netSend(conn, type, data) {
-  try { conn.send({ t: type, d: data }); } catch(e) {}
+  try { conn.send({ t: type, d: data }); } catch(e) { netLog('send() failed:', e); }
 }
 
 function netBroadcast(type, data, exceptId) {
@@ -418,33 +434,80 @@ function netBroadcast(type, data, exceptId) {
   }
 }
 
-// Host: creates a peer with a fixed ID derived from a random room code,
-// so a joining client can connect directly without a relay lookup.
+// ─── Debug logging ───────────────────────────────────────────
+// Everything network-related logs to the console under [VOID.NET] so
+// connection problems (blocked CDN, NAT/firewall issues, dropped peers,
+// bad room codes) are visible instead of failing silently.
+const NET_DEBUG = true;
+function netLog(...args) {
+  if (NET_DEBUG) console.log('%c[VOID.NET]', 'color:#7ec8e3;font-weight:bold', ...args);
+}
+window.addEventListener('error', e => console.error('[VOID.ERROR]', e.message, e.filename + ':' + e.lineno));
+
+// 3-letter room codes (A-Z, no I/O to avoid 1/0 confusion) — short enough
+// to read out loud for a quick 1v1, regenerated automatically if the
+// signaling server reports that ID is already taken.
+const CODE_LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+function makeRoomCode() {
+  let s = '';
+  for (let i = 0; i < 3; i++) s += CODE_LETTERS[Math.floor(Math.random() * CODE_LETTERS.length)];
+  return s;
+}
+
+// Host: creates a peer with a fixed ID derived from a random 3-letter room
+// code, so a joining client can connect directly without a relay lookup.
 function hostGame() {
+  if (typeof Peer === 'undefined') {
+    setStatus('ERROR: NETWORK LIBRARY FAILED TO LOAD');
+    console.error('[VOID.NET] PeerJS did not load. Check your internet connection, ad blocker, or content blocker — it loads from cdnjs.cloudflare.com.');
+    return;
+  }
   localName = (document.getElementById('name-input').value.trim().toUpperCase() || 'GHOST').slice(0,12);
   setStatus('CONNECTING…');
-  const code = 'VOID' + Math.random().toString(36).slice(2,8).toUpperCase();
-  peer = new Peer(code, { debug: 0 });
-  peer.on('open', id => {
+  attemptHost(0);
+}
+
+function attemptHost(retryCount) {
+  const code = makeRoomCode();
+  const fullId = 'VOID' + code;
+  netLog('Hosting attempt', retryCount + 1, '— code:', code, '(peer id:', fullId + ')');
+  const p = new Peer(fullId, { debug: 0 });
+  peer = p;
+
+  p.on('open', id => {
     myId = id;
     isHost = true;
-    const displayCode = id.replace('VOID','');
-    document.getElementById('room-code-val').textContent = displayCode;
+    document.getElementById('room-code-val').textContent = code;
     document.getElementById('room-code-display').style.display = 'block';
-    setStatus('HOSTING · ' + displayCode);
+    setStatus('HOSTING · ' + code);
+    netLog('Signaling connected. Peer ID:', id, '— share code:', code, '— waiting for players…');
     initMyPlayer();
     startGame();
-    peer.on('connection', conn => {
+    p.on('connection', conn => {
+      netLog('Incoming connection request from', conn.peer);
       conn.on('open', () => {
         clientConns[conn.peer] = conn;
-        conn.on('data', d => onHostReceive(conn.peer, d));
-        conn.on('close', () => onClientDisconnected(conn.peer));
-        conn.on('error', () => onClientDisconnected(conn.peer));
+        netLog('Data channel OPEN with', conn.peer);
+        conn.on('data', d => { netLog('recv ←', conn.peer, d); onHostReceive(conn.peer, d); });
+        conn.on('close', () => { netLog('Data channel CLOSED:', conn.peer); onClientDisconnected(conn.peer); });
+        conn.on('error', err => { netLog('Data channel ERROR:', conn.peer, err); onClientDisconnected(conn.peer); });
       });
     });
   });
-  peer.on('error', e => setStatus('ERROR: ' + e.type));
-  peer.on('disconnected', () => { if (gameRunning) setStatus('RECONNECTING…'); });
+  p.on('error', e => {
+    netLog('Peer error:', e.type, e);
+    if (e.type === 'unavailable-id' && retryCount < 5) {
+      netLog('Room code collision — generating a new code…');
+      p.destroy();
+      attemptHost(retryCount + 1);
+      return;
+    }
+    setStatus('ERROR: ' + e.type);
+  });
+  p.on('disconnected', () => {
+    netLog('Disconnected from signaling server (data channels to already-connected players keep working)');
+    if (gameRunning) setStatus('RECONNECTING…');
+  });
 }
 
 function onClientDisconnected(peerId) {
@@ -458,6 +521,11 @@ function onClientDisconnected(peerId) {
 }
 
 function joinGame() {
+  if (typeof Peer === 'undefined') {
+    setStatus('ERROR: NETWORK LIBRARY FAILED TO LOAD');
+    console.error('[VOID.NET] PeerJS did not load. Check your internet connection, ad blocker, or content blocker — it loads from cdnjs.cloudflare.com.');
+    return;
+  }
   localName = (document.getElementById('name-input').value.trim().toUpperCase() || 'GHOST').slice(0,12);
   const raw = document.getElementById('room-input').value.trim().toUpperCase();
   if (!raw) { setStatus('ENTER A ROOM CODE'); return; }
@@ -472,22 +540,25 @@ function joinGame() {
   peer.on('open', id => {
     myId = id;
     const hostPeerId = 'VOID' + raw;
+    netLog('Signaling connected. My peer ID:', id, '— connecting to', hostPeerId);
     const conn = peer.connect(hostPeerId, { reliable: true, serialization: 'json' });
     hostConn = conn;
     conn.on('open', () => {
       clearTimeout(connectTimeout);
       setStatus('CONNECTED · WAITING…');
+      netLog('Data channel OPEN with host', hostPeerId);
       netSend(conn, NET_MSG.JOIN, { name: localName, id: myId });
     });
-    conn.on('data', d => onClientReceive(d));
-    conn.on('close', () => onHostDisconnected());
-    conn.on('error', () => setStatus('CONNECTION ERROR · TRY AGAIN'));
+    conn.on('data', d => { netLog('recv ←', d); onClientReceive(d); });
+    conn.on('close', () => { netLog('Data channel CLOSED (host)'); onHostDisconnected(); });
+    conn.on('error', err => { netLog('Data channel ERROR:', err); setStatus('CONNECTION ERROR · TRY AGAIN'); });
   });
   peer.on('error', e => {
+    netLog('Peer error:', e.type, e);
     clearTimeout(connectTimeout);
     setStatus(e.type === 'peer-unavailable' ? 'NO GAME FOUND · CHECK CODE' : 'ERROR: ' + e.type);
   });
-  peer.on('disconnected', () => { if (gameRunning) setStatus('RECONNECTING…'); });
+  peer.on('disconnected', () => { netLog('Disconnected from signaling server'); if (gameRunning) setStatus('RECONNECTING…'); });
 }
 
 function onHostDisconnected() {
@@ -498,6 +569,7 @@ function onHostDisconnected() {
 function onHostReceive(senderId, msg) {
   switch(msg.t) {
     case NET_MSG.JOIN: {
+      netLog('Player joined:', msg.d.name, '(' + senderId + ')');
       // Send welcome with full game state
       const sp = randomSpawn(Object.keys(players).length);
       players[senderId] = createNetPlayer(senderId, msg.d.name, sp);
@@ -513,6 +585,7 @@ function onHostReceive(senderId, msg) {
       netBroadcast(NET_MSG.STATE, {
         id: senderId, name: msg.d.name, x: sp.x, z: sp.z, hp: MAX_HP, kills:0, deaths:0
       }, senderId);
+      showFeedMessage(msg.d.name + ' JOINED');
       updateScoreboard();
       break;
     }
@@ -682,6 +755,7 @@ function initMyPlayer(sx, sz) {
     name: localName,
     eyeH: EYE_H,
   };
+  netLog('Spawned at', { x: sx, z: sz }, isWall(sx, sz) ? '⚠ INSIDE A WALL — movement will look broken!' : '(clear)');
 }
 
 // ═══════════════════════════════════════════════════════════
