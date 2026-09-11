@@ -184,6 +184,21 @@
   #dead-text { font-size: 11px; letter-spacing: 6px; color: #cc3333; }
   #respawn-timer { font-size: 32px; font-weight: 900; color: #e0e0e0; }
   #killed-by { font-size: 10px; color: #444; letter-spacing: 2px; }
+
+  /* Connection lost screen */
+  #conn-lost-screen {
+    position: fixed; inset: 0; background: rgba(10,10,10,0.94); z-index: 200;
+    display: none; align-items: center; justify-content: center;
+    flex-direction: column; gap: 14px;
+  }
+  #conn-lost-screen.show { display: flex; }
+  #conn-lost-text { font-size: 13px; letter-spacing: 6px; color: #cc3333; }
+  #conn-lost-reason { font-size: 10px; color: #666; letter-spacing: 2px; }
+  #conn-lost-btn {
+    margin-top: 16px; padding: 10px 24px; font-size: 10px; letter-spacing: 3px;
+    border: 1px solid #333; cursor: pointer; color: #e0e0e0; transition: border-color 0.15s;
+  }
+  #conn-lost-btn:hover { border-color: #666; }
 </style>
 </head>
 <body>
@@ -296,6 +311,13 @@
   <div id="killed-by">killed by —</div>
 </div>
 
+<!-- Connection lost screen -->
+<div id="conn-lost-screen">
+  <div id="conn-lost-text">CONNECTION LOST</div>
+  <div id="conn-lost-reason">—</div>
+  <div id="conn-lost-btn" onclick="location.reload()">RETURN TO LOBBY</div>
+</div>
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.2/peerjs.min.js"></script>
 <script>
 'use strict';
@@ -396,57 +418,9 @@ function netBroadcast(type, data, exceptId) {
   }
 }
 
+// Host: creates a peer with a fixed ID derived from a random room code,
+// so a joining client can connect directly without a relay lookup.
 function hostGame() {
-  localName = (document.getElementById('name-input').value.trim().toUpperCase() || 'GHOST').slice(0,12);
-  setStatus('CONNECTING…');
-  peer = new Peer(null, { debug: 0 });
-  peer.on('open', id => {
-    myId = id;
-    isHost = true;
-    const code = id.slice(-6).toUpperCase();
-    document.getElementById('room-code-val').textContent = code;
-    document.getElementById('room-code-display').style.display = 'block';
-    setStatus('HOSTING · ' + code);
-    initMyPlayer();
-    startGame();
-    peer.on('connection', conn => {
-      conn.on('open', () => {
-        clientConns[conn.peer] = conn;
-        conn.on('data', d => onHostReceive(conn.peer, d));
-        conn.on('close', () => {
-          netBroadcast(NET_MSG.LEAVE, { id: conn.peer });
-          delete clientConns[conn.peer];
-          delete players[conn.peer];
-          updateScoreboard();
-        });
-      });
-    });
-  });
-  peer.on('error', e => setStatus('ERROR: ' + e.type));
-}
-
-function joinGame() {
-  localName = (document.getElementById('name-input').value.trim().toUpperCase() || 'GHOST').slice(0,12);
-  const raw = document.getElementById('room-input').value.trim().toUpperCase();
-  if (!raw) { setStatus('ENTER A ROOM CODE'); return; }
-  setStatus('CONNECTING…');
-  peer = new Peer(null, { debug: 0 });
-  peer.on('open', id => {
-    myId = id;
-    // find peer whose id ends with the code
-    const conn = peer.connect(raw.length === 6 ? raw : raw, { reliable: false });
-    hostConn = conn;
-    conn.on('open', () => setStatus('CONNECTED · WAITING…'));
-    conn.on('data', d => onClientReceive(d));
-    conn.on('close', () => setStatus('DISCONNECTED'));
-    // Actually we need full peer id; host shares last 6 chars, so we need a relay
-    // Solution: use room code AS the peer id suffix via a known prefix
-  });
-  peer.on('error', e => { setStatus('FAILED: ' + e.type); });
-}
-
-// Better join: host uses fixed peer ID based on room code
-function hostGame2() {
   localName = (document.getElementById('name-input').value.trim().toUpperCase() || 'GHOST').slice(0,12);
   setStatus('CONNECTING…');
   const code = 'VOID' + Math.random().toString(36).slice(2,8).toUpperCase();
@@ -464,42 +438,62 @@ function hostGame2() {
       conn.on('open', () => {
         clientConns[conn.peer] = conn;
         conn.on('data', d => onHostReceive(conn.peer, d));
-        conn.on('close', () => {
-          netBroadcast(NET_MSG.LEAVE, { id: conn.peer });
-          delete clientConns[conn.peer];
-          delete players[conn.peer];
-          updateScoreboard();
-        });
+        conn.on('close', () => onClientDisconnected(conn.peer));
+        conn.on('error', () => onClientDisconnected(conn.peer));
       });
     });
   });
   peer.on('error', e => setStatus('ERROR: ' + e.type));
+  peer.on('disconnected', () => { if (gameRunning) setStatus('RECONNECTING…'); });
 }
 
-function joinGame2() {
+function onClientDisconnected(peerId) {
+  if (!clientConns[peerId] && !players[peerId]) return; // already handled
+  const name = players[peerId] ? players[peerId].name : 'PLAYER';
+  netBroadcast(NET_MSG.LEAVE, { id: peerId });
+  delete clientConns[peerId];
+  delete players[peerId];
+  updateScoreboard();
+  if (gameRunning) showFeedMessage(name + ' DISCONNECTED');
+}
+
+function joinGame() {
   localName = (document.getElementById('name-input').value.trim().toUpperCase() || 'GHOST').slice(0,12);
   const raw = document.getElementById('room-input').value.trim().toUpperCase();
   if (!raw) { setStatus('ENTER A ROOM CODE'); return; }
   setStatus('CONNECTING…');
   peer = new Peer(null, { debug: 0 });
+
+  // Fail loudly if the handshake never completes instead of hanging forever
+  const connectTimeout = setTimeout(() => {
+    if (!gameRunning) setStatus('TIMED OUT · CHECK CODE & TRY AGAIN');
+  }, 12000);
+
   peer.on('open', id => {
     myId = id;
     const hostPeerId = 'VOID' + raw;
-    const conn = peer.connect(hostPeerId, { reliable: false, serialization: 'json' });
+    const conn = peer.connect(hostPeerId, { reliable: true, serialization: 'json' });
     hostConn = conn;
     conn.on('open', () => {
+      clearTimeout(connectTimeout);
       setStatus('CONNECTED · WAITING…');
       netSend(conn, NET_MSG.JOIN, { name: localName, id: myId });
     });
     conn.on('data', d => onClientReceive(d));
-    conn.on('close', () => setStatus('DISCONNECTED'));
+    conn.on('close', () => onHostDisconnected());
+    conn.on('error', () => setStatus('CONNECTION ERROR · TRY AGAIN'));
   });
-  peer.on('error', e => setStatus('ERROR: cannot find room · check code'));
+  peer.on('error', e => {
+    clearTimeout(connectTimeout);
+    setStatus(e.type === 'peer-unavailable' ? 'NO GAME FOUND · CHECK CODE' : 'ERROR: ' + e.type);
+  });
+  peer.on('disconnected', () => { if (gameRunning) setStatus('RECONNECTING…'); });
 }
 
-// Rebind buttons
-document.querySelector('.btn-host').onclick = hostGame2;
-document.querySelector('.btn-join').onclick = joinGame2;
+function onHostDisconnected() {
+  if (!gameRunning) { setStatus('DISCONNECTED'); return; }
+  showConnLostOverlay('HOST LEFT OR CONNECTION DROPPED');
+}
 
 function onHostReceive(senderId, msg) {
   switch(msg.t) {
@@ -580,10 +574,7 @@ function onClientReceive(msg) {
     case NET_MSG.WELCOME: {
       const d = msg.d;
       d.players.forEach(p => {
-        if (p.id === d.yourId) {
-          // me
-          me.x = p.x; me.z = p.z; me.y = p.y || EYE_H;
-        } else {
+        if (p.id !== d.yourId) {
           players[p.id] = createNetPlayer(p.id, p.name, { x: p.x, z: p.z });
           players[p.id].kills  = p.kills;
           players[p.id].deaths = p.deaths;
@@ -746,13 +737,28 @@ const ctx    = canvas.getContext('2d', { alpha: false });
 let W = 0, H = 0, halfH = 0;
 let zBuffer = [];
 
+// The canvas element is styled to fill the viewport (100vw/100vh) via CSS,
+// but the raycaster's cost scales directly with the drawing-buffer
+// resolution (one raycast + one fillRect per column). Capping the internal
+// buffer width and letting the browser upscale it keeps frame time smooth
+// on large/high-DPI displays at a negligible sharpness cost for this
+// flat-shaded, minimalist art style.
+const RENDER_MAX_WIDTH = 960;
+let resizeQueued = false;
+
 function resize() {
-  W = canvas.width  = window.innerWidth;
-  H = canvas.height = window.innerHeight;
+  const scale = Math.min(1, RENDER_MAX_WIDTH / window.innerWidth);
+  W = canvas.width  = Math.max(320, Math.round(window.innerWidth  * scale));
+  H = canvas.height = Math.max(240, Math.round(window.innerHeight * scale));
   halfH = H >> 1;
   zBuffer = new Float32Array(W);
 }
-window.addEventListener('resize', resize);
+window.addEventListener('resize', () => {
+  // Debounce resize so a window drag doesn't reallocate zBuffer every frame
+  if (resizeQueued) return;
+  resizeQueued = true;
+  requestAnimationFrame(() => { resize(); resizeQueued = false; });
+});
 resize();
 
 // Precompute wall shading palette
@@ -1254,6 +1260,20 @@ function showKillFeed(killer, victim, isYou) {
   el.textContent = killer + ' → ' + victim;
   feed.appendChild(el);
   setTimeout(() => el.remove(), 3200);
+}
+function showFeedMessage(text) {
+  const feed = document.getElementById('kill-feed');
+  const el = document.createElement('div');
+  el.className = 'kill-entry';
+  el.textContent = text;
+  feed.appendChild(el);
+  setTimeout(() => el.remove(), 3200);
+}
+function showConnLostOverlay(reason) {
+  gameRunning = false;
+  document.exitPointerLock && document.exitPointerLock();
+  document.getElementById('conn-lost-reason').textContent = reason;
+  document.getElementById('conn-lost-screen').classList.add('show');
 }
 function showScoreboard(show) {
   document.getElementById('scoreboard').style.display = show ? 'block' : 'none';
